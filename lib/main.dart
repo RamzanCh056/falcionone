@@ -4,9 +4,11 @@ import 'dart:math';
 
 import 'package:falcon_one_demo/app.dart';
 import 'package:falcon_one_demo/data/call_service.dart';
+import 'package:falcon_one_demo/mapbox_config.dart';
 import 'package:falcon_one_demo/utils/call_foreground_task.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:get/get.dart';
 import 'package:http/http.dart' as http;
@@ -26,13 +28,16 @@ const String _agoraTokenServer = String.fromEnvironment(
   defaultValue: 'https://agora-token-service-production-ba0dd.up.railway.app',
 );
 
-/// Public Mapbox access token — supply at build/run time (not committed).
-/// Example: `flutter run --dart-define=MAPBOX_ACCESS_TOKEN=pk.your...`
-const String _mapboxAccessToken = String.fromEnvironment('MAPBOX_ACCESS_TOKEN');
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterForegroundTask.initCommunicationPort();
+
+  try {
+    await dotenv.load(fileName: 'assets/mapbox.env');
+  } catch (e, st) {
+    debugPrint('Could not load assets/mapbox.env ($e). Using dart-define only.');
+    debugPrint('$st');
+  }
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
@@ -41,9 +46,7 @@ Future<void> main() async {
 
   await CallForegroundTaskManager.ensureInitialized();
 
-  if (!await initializeServices()) {
-    throw Exception("Failed to initialize services");
-  }
+  await initializeServices();
 
   if (!await initializeAudio()) {
     throw Exception("Failed to initialize audio");
@@ -52,19 +55,23 @@ Future<void> main() async {
   runApp(WithForegroundTask(child: const FalconOneDemoApp()));
 }
 
-Future<bool> initializeServices() async {
-  if (_mapboxAccessToken.isEmpty) {
+/// Mapbox token: `--dart-define=MAPBOX_ACCESS_TOKEN=...` wins over [assets/mapbox.env].
+Future<void> initializeServices() async {
+  const fromDefine = String.fromEnvironment('MAPBOX_ACCESS_TOKEN');
+  final fromFile = dotenv.env['MAPBOX_ACCESS_TOKEN']?.trim() ?? '';
+  final token = fromDefine.isNotEmpty ? fromDefine : fromFile;
+
+  mapboxAccessTokenConfigured = token.isNotEmpty;
+  if (!mapboxAccessTokenConfigured) {
     debugPrint(
-      'MAPBOX_ACCESS_TOKEN is not set. Mapbox will not initialize until you pass '
-      '--dart-define=MAPBOX_ACCESS_TOKEN=your_public_token',
+      'Mapbox: no token. Set MAPBOX_ACCESS_TOKEN in assets/mapbox.env on this machine, '
+      'or run: flutter run --dart-define=MAPBOX_ACCESS_TOKEN=pk.your_public_token',
     );
-    return false;
+  } else {
+    MapboxOptions.setAccessToken(token);
   }
-  MapboxOptions.setAccessToken(_mapboxAccessToken);
 
   await Permission.locationWhenInUse.request();
-
-  return true;
 }
 
 Future<bool> initializeAudio() async {

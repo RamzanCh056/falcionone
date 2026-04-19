@@ -1,5 +1,6 @@
 import 'package:falcon_one_demo/components/panel_button.dart';
 import 'package:falcon_one_demo/controllers/map_controller.dart';
+import 'package:falcon_one_demo/mapbox_config.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_liquid_glass/liquid_glass.dart';
 import 'package:get/get.dart';
@@ -26,6 +27,22 @@ class MapView extends GetView<MapController> {
   }
 
   Widget _buildMap() {
+    if (!mapboxAccessTokenConfigured) {
+      return Container(
+        color: const Color(0xFF121212),
+        alignment: Alignment.center,
+        padding: const EdgeInsets.all(24),
+        child: const Text(
+          'Mapbox token missing.\n\n'
+          'Edit assets/mapbox.env and set:\n'
+          'MAPBOX_ACCESS_TOKEN=pk.your_public_token\n\n'
+          'Or run with:\n'
+          'flutter run --dart-define=MAPBOX_ACCESS_TOKEN=pk....',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white70, height: 1.4),
+        ),
+      );
+    }
     return MapWidget(
       onMapCreated: controller.onMapCreated,
       styleUri: "mapbox://styles/fiddlie-ed/cmc9h7ar2035801sm6361cdtc",
