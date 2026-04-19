@@ -48,8 +48,12 @@ Future<void> main() async {
 
   await initializeServices();
 
-  if (!await initializeAudio()) {
-    throw Exception("Failed to initialize audio");
+  final audioOk = await initializeAudio();
+  if (!audioOk) {
+    debugPrint(
+      'Audio / Agora did not start (mic, network, or token server). '
+      'Map and W1 screens still work; grant mic permission and check network to enable voice.',
+    );
   }
 
   runApp(WithForegroundTask(child: const FalconOneDemoApp()));
