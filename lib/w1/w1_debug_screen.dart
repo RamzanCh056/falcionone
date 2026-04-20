@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:falcon_one_demo/w1/w1_platform.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 /// Developer / QA screen for the W1 transfer pipeline (BLE → Wi‑Fi → file).
 class W1DebugScreen extends StatefulWidget {
@@ -41,6 +43,22 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
         ..clear()
         ..addAll(lines.reversed);
     });
+  }
+
+  /// Android 12+ requires [Permission.bluetoothScan] and [Permission.bluetoothConnect] at runtime.
+  Future<bool> _ensureAndroidBlePermissions() async {
+    if (!Platform.isAndroid) return true;
+    final statuses = await <Permission>[
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+    ].request();
+    final scan = statuses[Permission.bluetoothScan] ?? PermissionStatus.denied;
+    final connect = statuses[Permission.bluetoothConnect] ?? PermissionStatus.denied;
+    if (scan.isGranted && connect.isGranted) return true;
+    if (scan.isPermanentlyDenied || connect.isPermanentlyDenied) {
+      await openAppSettings();
+    }
+    return false;
   }
 
   @override
@@ -144,10 +162,23 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
               ),
               OutlinedButton(
                 onPressed: () async {
+                  final ok = await _ensureAndroidBlePermissions();
+                  if (!context.mounted) return;
+                  if (!ok) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Bluetooth scan/connect permission required. '
+                          'Allow both in Settings if you denied permanently.',
+                        ),
+                      ),
+                    );
+                    return;
+                  }
                   await W1Platform.startRealBle();
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Real BLE scan started — grant Bluetooth permissions')),
+                    const SnackBar(content: Text('Real BLE scan started')),
                   );
                 },
                 child: const Text('Start real BLE'),
