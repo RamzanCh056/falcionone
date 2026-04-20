@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:falcon_one_demo/w1/w1_classic_bluetooth.dart';
 import 'package:falcon_one_demo/w1/w1_platform.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-/// Developer / QA screen for the W1 transfer pipeline (BLE → Wi‑Fi → file).
+/// Developer / QA screen for the W1 transfer pipeline (classic BT + Wi‑Fi → file).
 class W1DebugScreen extends StatefulWidget {
   const W1DebugScreen({super.key});
 
@@ -23,6 +24,9 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
   @override
   void initState() {
     super.initState();
+    W1ClassicBluetooth.instance.onLogLinesChanged = () {
+      if (mounted) setState(() {});
+    };
     _sub = W1Platform.stateStream().listen((event) {
       setState(() => _state = event);
     });
@@ -30,6 +34,7 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
 
   @override
   void dispose() {
+    W1ClassicBluetooth.instance.onLogLinesChanged = null;
     _sub?.cancel();
     _url.dispose();
     _recordingId.dispose();
@@ -56,26 +61,6 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     final connect = statuses[Permission.bluetoothConnect] ?? PermissionStatus.denied;
     if (scan.isGranted && connect.isGranted) return true;
     if (scan.isPermanentlyDenied || connect.isPermanentlyDenied) {
-      await openAppSettings();
-    }
-    return false;
-  }
-
-  /// BLE GATT connect: also request location (many OEMs need Location ON for reliable BLE).
-  Future<bool> _ensureAndroidBleConnectAndLocation() async {
-    if (!Platform.isAndroid) return true;
-    final statuses = await <Permission>[
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ].request();
-    final scan = statuses[Permission.bluetoothScan] ?? PermissionStatus.denied;
-    final connect = statuses[Permission.bluetoothConnect] ?? PermissionStatus.denied;
-    final loc = statuses[Permission.locationWhenInUse] ?? PermissionStatus.denied;
-    if (scan.isGranted && connect.isGranted && loc.isGranted) return true;
-    if (scan.isPermanentlyDenied ||
-        connect.isPermanentlyDenied ||
-        loc.isPermanentlyDenied) {
       await openAppSettings();
     }
     return false;
@@ -182,79 +167,61 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
               ),
               OutlinedButton(
                 onPressed: () async {
+                  if (!Platform.isAndroid) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Classic Bluetooth is Android-only.')),
+                    );
+                    return;
+                  }
                   final ok = await _ensureAndroidBlePermissions();
                   if (!context.mounted) return;
                   if (!ok) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
                         content: Text(
-                          'Bluetooth scan/connect permission required. '
-                          'Allow both in Settings if you denied permanently.',
+                          'Bluetooth permissions required. Allow in Settings if denied permanently.',
                         ),
                       ),
                     );
                     return;
                   }
-                  await W1Platform.startRealBle();
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Real BLE scan started')),
-                  );
+                  try {
+                    await W1ClassicBluetooth.instance.connectBondedW1();
+                    if (!context.mounted) return;
+                    setState(() {});
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(W1ClassicBluetooth.instance.status.value ?? 'Connected')),
+                    );
+                  } catch (e) {
+                    if (!context.mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('$e')),
+                    );
+                  }
                 },
-                child: const Text('Start real BLE'),
+                child: const Text('Connect Classic W1'),
               ),
               OutlinedButton(
                 onPressed: () async {
-                  final ok = await _ensureAndroidBleConnectAndLocation();
+                  W1ClassicBluetooth.instance.sendLogSample();
                   if (!context.mounted) return;
-                  if (!ok) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          'Bluetooth scan/connect and location permission required for GATT. '
-                          'Enable system Location if it is off.',
-                        ),
-                      ),
-                    );
-                    return;
-                  }
-                  await W1Platform.connectW1(macAddress: '74:43:8F:7E:D2:A4');
-                  if (!context.mounted) return;
+                  setState(() {});
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('GATT connect requested — check W1 logs')),
+                    const SnackBar(content: Text('Send sample logged — see debug console / classic log')),
                   );
                 },
-                child: const Text('Connect W1'),
+                child: const Text('Classic send sample'),
               ),
               OutlinedButton(
                 onPressed: () async {
-                  final ok = await _ensureAndroidBlePermissions();
+                  await W1ClassicBluetooth.instance.disconnect();
                   if (!context.mounted) return;
-                  if (!ok) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          'Bluetooth scan/connect permission required for BLE probe.',
-                        ),
-                      ),
-                    );
-                    return;
-                  }
-                  await W1Platform.runAnonymousBleProbe();
-                  if (!context.mounted) return;
+                  setState(() {});
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                        'Anonymous BLE probe started (scan buffer, top 3 by RSSI). See W1 logs.',
-                      ),
-                    ),
+                    const SnackBar(content: Text('Classic Bluetooth disconnected')),
                   );
                 },
-                child: const Text('Probe unnamed BLE'),
-              ),
-              OutlinedButton(
-                onPressed: () => W1Platform.stopRealBle(),
-                child: const Text('Stop real BLE'),
+                child: const Text('Disconnect Classic W1'),
               ),
               OutlinedButton(
                 onPressed: _refreshLogs,
@@ -273,7 +240,16 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
             ],
           ),
           const SizedBox(height: 24),
-          Text('Recent log lines', style: Theme.of(context).textTheme.titleSmall),
+          Text('Classic Bluetooth (RFCOMM) log', style: Theme.of(context).textTheme.titleSmall),
+          const SizedBox(height: 8),
+          ...W1ClassicBluetooth.instance.logLines.reversed.map(
+            (l) => Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: SelectableText(l, style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text('Native W1 log lines', style: Theme.of(context).textTheme.titleSmall),
           const SizedBox(height: 8),
           ..._logs.map(
             (l) => Padding(

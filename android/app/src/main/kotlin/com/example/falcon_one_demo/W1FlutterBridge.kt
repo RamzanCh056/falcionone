@@ -4,15 +4,12 @@ import android.os.Handler
 import android.os.Looper
 import com.example.falcon_one_demo.w1.MockW1WifiFileClient
 import com.example.falcon_one_demo.w1.OkHttpW1WifiFileClient
-import com.example.falcon_one_demo.w1.RealW1DeviceService
 import com.example.falcon_one_demo.w1.RemoteRecording
 import com.example.falcon_one_demo.w1.SharedPrefsW1CheckpointStore
 import com.example.falcon_one_demo.w1.W1BleStubTransport
-import com.example.falcon_one_demo.w1.W1DeviceUuids
 import com.example.falcon_one_demo.w1.W1Logger
 import com.example.falcon_one_demo.w1.W1SwitchableBleTransport
 import com.example.falcon_one_demo.w1.W1TransferEngine
-import com.example.falcon_one_demo.w1.W1WifiNetworkBinder
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -44,7 +41,6 @@ object W1FlutterBridge {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val mainHandler = Handler(Looper.getMainLooper())
         val eventSinkRef = AtomicReference<EventChannel.EventSink?>(null)
-        var realDeviceService: RealW1DeviceService? = null
 
         val transferEngine = W1TransferEngine(
             appScope = scope,
@@ -140,57 +136,6 @@ object W1FlutterBridge {
                         val out = ctx.cacheDir.resolve("w1_logs_export.txt")
                         val ok = logger.exportRingToFile(out)
                         result.success(if (ok) out.absolutePath else null)
-                    }
-
-                    "startRealBle" -> {
-                        realDeviceService?.stop()
-                        realDeviceService = RealW1DeviceService(
-                            appContext = ctx,
-                            engine = transferEngine,
-                            switchableBle = switchableBle,
-                            logger = logger,
-                            uuids = W1DeviceUuids(),
-                            wifiBinder = W1WifiNetworkBinder(ctx, logger),
-                        )
-                        realDeviceService?.start()
-                        result.success(null)
-                    }
-
-                    "stopRealBle" -> {
-                        realDeviceService?.stop()
-                        realDeviceService = null
-                        result.success(null)
-                    }
-
-                    "connectW1" -> {
-                        val mac = call.argument<String>("macAddress") ?: "74:43:8F:7E:D2:A4"
-                        if (realDeviceService == null) {
-                            realDeviceService = RealW1DeviceService(
-                                appContext = ctx,
-                                engine = transferEngine,
-                                switchableBle = switchableBle,
-                                logger = logger,
-                                uuids = W1DeviceUuids(),
-                                wifiBinder = W1WifiNetworkBinder(ctx, logger),
-                            )
-                        }
-                        realDeviceService?.connectToDevice(mac)
-                        result.success(null)
-                    }
-
-                    "runAnonymousBleProbe" -> {
-                        if (realDeviceService == null) {
-                            realDeviceService = RealW1DeviceService(
-                                appContext = ctx,
-                                engine = transferEngine,
-                                switchableBle = switchableBle,
-                                logger = logger,
-                                uuids = W1DeviceUuids(),
-                                wifiBinder = W1WifiNetworkBinder(ctx, logger),
-                            )
-                        }
-                        realDeviceService?.runAnonymousConnectProbe()
-                        result.success(null)
                     }
 
                     else -> result.notImplemented()

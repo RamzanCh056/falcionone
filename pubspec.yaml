@@ -20,6 +20,7 @@ dependencies:
   http: ^1.1.0
   geolocator: ^14.0.2
   flutter_foreground_task: ^9.1.0
+  flutter_bluetooth_serial: ^0.4.0
 
 dev_dependencies:
   flutter_test:
