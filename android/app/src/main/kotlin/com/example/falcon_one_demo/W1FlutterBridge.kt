@@ -162,6 +162,22 @@ object W1FlutterBridge {
                         result.success(null)
                     }
 
+                    "connectW1" -> {
+                        val mac = call.argument<String>("macAddress") ?: "74:43:8F:7E:D2:A4"
+                        if (realDeviceService == null) {
+                            realDeviceService = RealW1DeviceService(
+                                appContext = ctx,
+                                engine = transferEngine,
+                                switchableBle = switchableBle,
+                                logger = logger,
+                                uuids = W1DeviceUuids(),
+                                wifiBinder = W1WifiNetworkBinder(ctx, logger),
+                            )
+                        }
+                        realDeviceService?.connectToDevice(mac)
+                        result.success(null)
+                    }
+
                     else -> result.notImplemented()
                 }
             } catch (e: Throwable) {

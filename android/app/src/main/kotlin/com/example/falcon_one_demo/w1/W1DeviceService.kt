@@ -33,8 +33,7 @@ class RealW1DeviceService(
 
     private var coordinator: W1BleGattCoordinator? = null
 
-    override fun start() {
-        stop()
+    private fun installEngineHooks() {
         engine.beforeWifiHttp = { sessionId ->
             val net = wifiBinder.awaitWifiAndBind(sessionId)
             engine.setWifiClient(
@@ -45,8 +44,10 @@ class RealW1DeviceService(
             wifiBinder.unbind(sessionId)
             engine.setWifiClient(OkHttpW1WifiFileClient())
         }
+    }
 
-        val c = W1BleGattCoordinator(
+    private fun newCoordinator(): W1BleGattCoordinator {
+        return W1BleGattCoordinator(
             context = appContext,
             logger = logger,
             uuids = uuids,
@@ -75,9 +76,35 @@ class RealW1DeviceService(
                 )
             },
         )
+    }
+
+    override fun start() {
+        stop()
+        installEngineHooks()
+        val c = newCoordinator()
         coordinator = c
         switchableBle.delegate = W1BleGattTransportImpl(c)
         c.startScanIfPermitted()
+    }
+
+    /**
+     * Direct GATT connect for exploration (no scan UUID filters).
+     * Safe if [start] was never called: installs engine hooks and a coordinator without starting a scan.
+     */
+    fun connectToDevice(macAddress: String) {
+        installEngineHooks()
+        if (coordinator == null) {
+            val c = newCoordinator()
+            coordinator = c
+            switchableBle.delegate = W1BleGattTransportImpl(c)
+        }
+        coordinator?.connectToDevice(macAddress.trim())
+            ?: logger.e(
+                engine.currentState().sessionId.ifEmpty { "ble" },
+                "ble_connect_skipped",
+                mapOf("reason" to "coordinator_null"),
+                null,
+            )
     }
 
     override fun stop() {

@@ -184,6 +184,28 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
                 child: const Text('Start real BLE'),
               ),
               OutlinedButton(
+                onPressed: () async {
+                  final ok = await _ensureAndroidBlePermissions();
+                  if (!context.mounted) return;
+                  if (!ok) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Bluetooth connect permission required for GATT.',
+                        ),
+                      ),
+                    );
+                    return;
+                  }
+                  await W1Platform.connectW1(macAddress: '74:43:8F:7E:D2:A4');
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('GATT connect requested — check W1 logs')),
+                  );
+                },
+                child: const Text('Connect W1'),
+              ),
+              OutlinedButton(
                 onPressed: () => W1Platform.stopRealBle(),
                 child: const Text('Stop real BLE'),
               ),

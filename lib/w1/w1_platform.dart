@@ -60,6 +60,17 @@ class W1Platform {
     await _method.invokeMethod<void>('stopRealBle');
   }
 
+  /// GATT connect by MAC and log all services/characteristics (Android).
+  /// [macAddress] defaults on the native side if omitted.
+  static Future<void> connectW1({String? macAddress}) async {
+    await _method.invokeMethod<void>(
+      'connectW1',
+      <String, dynamic>{
+        if (macAddress != null) 'macAddress': macAddress,
+      },
+    );
+  }
+
   static Future<List<String>> getRecentLogs({int limit = 200}) async {
     final Object? raw = await _method.invokeMethod<Object?>('getRecentLogs', <String, dynamic>{
       'limit': limit,
