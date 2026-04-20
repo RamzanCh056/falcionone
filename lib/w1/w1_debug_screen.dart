@@ -61,6 +61,26 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     return false;
   }
 
+  /// BLE GATT connect: also request location (many OEMs need Location ON for reliable BLE).
+  Future<bool> _ensureAndroidBleConnectAndLocation() async {
+    if (!Platform.isAndroid) return true;
+    final statuses = await <Permission>[
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+    ].request();
+    final scan = statuses[Permission.bluetoothScan] ?? PermissionStatus.denied;
+    final connect = statuses[Permission.bluetoothConnect] ?? PermissionStatus.denied;
+    final loc = statuses[Permission.locationWhenInUse] ?? PermissionStatus.denied;
+    if (scan.isGranted && connect.isGranted && loc.isGranted) return true;
+    if (scan.isPermanentlyDenied ||
+        connect.isPermanentlyDenied ||
+        loc.isPermanentlyDenied) {
+      await openAppSettings();
+    }
+    return false;
+  }
+
   @override
   Widget build(BuildContext context) {
     final phase = _state['phase']?.toString() ?? '—';
@@ -185,13 +205,14 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
               ),
               OutlinedButton(
                 onPressed: () async {
-                  final ok = await _ensureAndroidBlePermissions();
+                  final ok = await _ensureAndroidBleConnectAndLocation();
                   if (!context.mounted) return;
                   if (!ok) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
                         content: Text(
-                          'Bluetooth connect permission required for GATT.',
+                          'Bluetooth scan/connect and location permission required for GATT. '
+                          'Enable system Location if it is off.',
                         ),
                       ),
                     );
