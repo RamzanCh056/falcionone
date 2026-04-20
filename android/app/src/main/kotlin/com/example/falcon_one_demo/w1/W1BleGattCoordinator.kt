@@ -31,6 +31,11 @@ class W1BleGattCoordinator(
     private val onRecordingCompleteJson: (recordingId: String, extras: Map<String, String?>) -> Unit,
     private val onBleError: (message: String) -> Unit,
 ) {
+    private companion object {
+        /** Same meaning as [ScanRecord] TX power sentinel when AD 0x0A is absent (AOSP value 127). */
+        private const val SCAN_TX_POWER_NOT_PRESENT = 127
+    }
+
     private val appContext = context.applicationContext
     private val adapter = (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
     private var scanner = adapter?.bluetoothLeScanner
@@ -69,9 +74,7 @@ class W1BleGattCoordinator(
         )
         formatManufacturerData(record)?.let { fields["mfrData"] = it }
         formatAdvertisedServiceUuids(record)?.let { fields["serviceUuids"] = it }
-        record?.txPowerLevel?.takeIf { it != ScanRecord.TX_POWER_NOT_PRESENT }?.let {
-            fields["txPower"] = it
-        }
+        record?.txPowerLevel?.takeIf { it != SCAN_TX_POWER_NOT_PRESENT }?.let { fields["txPower"] = it }
         if (Build.VERSION.SDK_INT >= 33) {
             val raw = record?.bytes
             if (raw != null && raw.isNotEmpty()) {
