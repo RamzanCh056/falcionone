@@ -71,6 +71,11 @@ class W1Platform {
     );
   }
 
+  /// Android: from scan buffer, try GATT to top 3 unnamed devices with RSSI > -70 (strongest first).
+  static Future<void> runAnonymousBleProbe() async {
+    await _method.invokeMethod<void>('runAnonymousBleProbe');
+  }
+
   static Future<List<String>> getRecentLogs({int limit = 200}) async {
     final Object? raw = await _method.invokeMethod<Object?>('getRecentLogs', <String, dynamic>{
       'limit': limit,

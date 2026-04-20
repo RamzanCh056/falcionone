@@ -178,6 +178,21 @@ object W1FlutterBridge {
                         result.success(null)
                     }
 
+                    "runAnonymousBleProbe" -> {
+                        if (realDeviceService == null) {
+                            realDeviceService = RealW1DeviceService(
+                                appContext = ctx,
+                                engine = transferEngine,
+                                switchableBle = switchableBle,
+                                logger = logger,
+                                uuids = W1DeviceUuids(),
+                                wifiBinder = W1WifiNetworkBinder(ctx, logger),
+                            )
+                        }
+                        realDeviceService?.runAnonymousConnectProbe()
+                        result.success(null)
+                    }
+
                     else -> result.notImplemented()
                 }
             } catch (e: Throwable) {

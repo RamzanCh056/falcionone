@@ -206,6 +206,32 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
                 child: const Text('Connect W1'),
               ),
               OutlinedButton(
+                onPressed: () async {
+                  final ok = await _ensureAndroidBlePermissions();
+                  if (!context.mounted) return;
+                  if (!ok) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Bluetooth scan/connect permission required for BLE probe.',
+                        ),
+                      ),
+                    );
+                    return;
+                  }
+                  await W1Platform.runAnonymousBleProbe();
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Anonymous BLE probe started (scan buffer, top 3 by RSSI). See W1 logs.',
+                      ),
+                    ),
+                  );
+                },
+                child: const Text('Probe unnamed BLE'),
+              ),
+              OutlinedButton(
                 onPressed: () => W1Platform.stopRealBle(),
                 child: const Text('Stop real BLE'),
               ),

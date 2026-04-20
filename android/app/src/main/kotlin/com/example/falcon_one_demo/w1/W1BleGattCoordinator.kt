@@ -15,10 +15,13 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Unfiltered BLE scan (all peripherals) with structured logs per advertisement.
@@ -41,7 +44,26 @@ class W1BleGattCoordinator(
         /** Bluetooth SIG assigned UUID for the Client Characteristic Configuration descriptor (enable notify/indicate). */
         private val GattDescriptorUuidClientCharacteristicConfig: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        private const val PROBE_CONNECT_TIMEOUT_MS = 15_000L
+        private const val PROBE_RETRY_DELAY_MS = 450L
     }
+
+    private data class ScanAgg(var bestRssi: Int, var displayNameAtBest: String)
+
+    private val scanAccumulator = ConcurrentHashMap<String, ScanAgg>()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val connectProbeTimeoutRunnable = Runnable { onConnectProbeTimeout() }
+
+    private var connectProbeActive: Boolean = false
+    private var connectProbeList: List<Pair<String, Int>> = emptyList()
+    private var connectProbeIndex: Int = 0
+    private var connectProbeAttemptMac: String? = null
+    private var connectProbeSawConnectedForAttempt: Boolean = false
+    private var connectProbeFailureHandledForAttempt: Boolean = false
+    private var probeAdvanceRunnable: Runnable? = null
+    private val probeLock = Any()
 
     private val appContext = context.applicationContext
     private val adapter = (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -94,6 +116,18 @@ class W1BleGattCoordinator(
             }
         }
         logger.i(sessionIdForLogs(), "ble_device_seen", fields)
+        recordScanSample(device.address, result.rssi, name)
+    }
+
+    private fun recordScanSample(address: String, rssi: Int, displayName: String) {
+        val key = address.uppercase(Locale.US)
+        scanAccumulator.merge(key, ScanAgg(rssi, displayName)) { old, incoming ->
+            if (incoming.bestRssi > old.bestRssi) {
+                ScanAgg(incoming.bestRssi, incoming.displayNameAtBest)
+            } else {
+                old
+            }
+        }
     }
 
     /** `COMPANY:HEX|…` from AD manufacturer blocks (helps identify devices that use "(no name)"). */
@@ -148,6 +182,10 @@ class W1BleGattCoordinator(
                 ),
             )
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                val skipPostConnectWork = handleConnectProbeConnected(gatt, status)
+                if (skipPostConnectWork) {
+                    return
+                }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     logger.i(
                         sessionIdForLogs(),
@@ -169,6 +207,7 @@ class W1BleGattCoordinator(
                     mapOf("started" to started),
                 )
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                handleConnectProbeDisconnected(gatt, status)
                 pendingNotifyCharacteristics.clear()
                 logger.i(
                     sessionIdForLogs(),
@@ -396,6 +435,254 @@ class W1BleGattCoordinator(
         logger.i(sessionIdForLogs(), "ble_notify_enabled", mapOf("uuid" to ch.uuid.toString()))
     }
 
+    private fun stopConnectProbe() {
+        mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
+        cancelProbeAdvanceOnly()
+        connectProbeActive = false
+        connectProbeList = emptyList()
+        connectProbeIndex = 0
+        connectProbeAttemptMac = null
+        connectProbeSawConnectedForAttempt = false
+        connectProbeFailureHandledForAttempt = false
+    }
+
+    private fun cancelProbeAdvanceOnly() {
+        probeAdvanceRunnable?.let { mainHandler.removeCallbacks(it) }
+        probeAdvanceRunnable = null
+    }
+
+    /** @return true if the outer [onConnectionStateChange] should skip pipeline + service discovery. */
+    private fun handleConnectProbeConnected(gatt: BluetoothGatt, status: Int): Boolean {
+        if (!connectProbeActive) return false
+        val addr = gatt.device.address.uppercase(Locale.US)
+        if (addr != connectProbeAttemptMac) return false
+        if (connectProbeSawConnectedForAttempt) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            logger.w(
+                sessionIdForLogs(),
+                "ble_probe_connection_result",
+                mapOf(
+                    "result" to "failure",
+                    "mac" to addr,
+                    "status" to status,
+                    "msg" to "Probe connection failed: $addr (connected with non-success status=$status)",
+                ),
+            )
+            connectProbeAttemptMac = null
+            val handled = synchronized(probeLock) {
+                if (connectProbeFailureHandledForAttempt) false
+                else {
+                    connectProbeFailureHandledForAttempt = true
+                    true
+                }
+            }
+            if (handled) {
+                mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
+                val next = connectProbeIndex + 1
+                scheduleTryProbeAt(next)
+            }
+            return true
+        }
+        connectProbeSawConnectedForAttempt = true
+        mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
+        val rssi = connectProbeList.getOrNull(connectProbeIndex)?.second ?: 0
+        logger.i(
+            sessionIdForLogs(),
+            "ble_probe_connection_result",
+            mapOf(
+                "result" to "success",
+                "mac" to addr,
+                "rssi" to rssi,
+                "msg" to "Probe connection succeeded: $addr (RSSI $rssi)",
+            ),
+        )
+        cancelProbeAdvanceOnly()
+        connectProbeActive = false
+        connectProbeAttemptMac = null
+        return false
+    }
+
+    private fun handleConnectProbeDisconnected(gatt: BluetoothGatt, status: Int) {
+        if (!connectProbeActive) return
+        val addr = gatt.device.address.uppercase(Locale.US)
+        if (addr != connectProbeAttemptMac) return
+        if (connectProbeSawConnectedForAttempt) return
+        val shouldHandle = synchronized(probeLock) {
+            if (connectProbeFailureHandledForAttempt) {
+                false
+            } else {
+                connectProbeFailureHandledForAttempt = true
+                true
+            }
+        }
+        if (!shouldHandle) return
+        mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
+        logger.w(
+            sessionIdForLogs(),
+            "ble_probe_connection_result",
+            mapOf(
+                "result" to "failure",
+                "mac" to addr,
+                "status" to status,
+                "msg" to "Probe connection failed: $addr (status=$status)",
+            ),
+        )
+        connectProbeAttemptMac = null
+        val next = connectProbeIndex + 1
+        scheduleTryProbeAt(next)
+    }
+
+    private fun onConnectProbeTimeout() {
+        if (!connectProbeActive) return
+        if (connectProbeSawConnectedForAttempt) return
+        val addr = connectProbeAttemptMac ?: return
+        val shouldHandle = synchronized(probeLock) {
+            if (connectProbeFailureHandledForAttempt) {
+                false
+            } else {
+                connectProbeFailureHandledForAttempt = true
+                true
+            }
+        }
+        if (!shouldHandle) return
+        logger.w(
+            sessionIdForLogs(),
+            "ble_probe_connection_result",
+            mapOf(
+                "result" to "failure",
+                "reason" to "timeout",
+                "mac" to addr,
+                "msg" to "Probe connection failed: $addr (timeout)",
+            ),
+        )
+        connectProbeAttemptMac = null
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        val next = connectProbeIndex + 1
+        scheduleTryProbeAt(next)
+    }
+
+    private fun scheduleTryProbeAt(nextIndex: Int) {
+        cancelProbeAdvanceOnly()
+        val r = Runnable {
+            probeAdvanceRunnable = null
+            tryConnectProbeAt(nextIndex)
+        }
+        probeAdvanceRunnable = r
+        mainHandler.postDelayed(r, PROBE_RETRY_DELAY_MS)
+    }
+
+    /**
+     * From accumulated scan results: unnamed devices with RSSI > -70, strongest first, try GATT to up to 3 MACs.
+     * Stops after the first successful connection.
+     */
+    fun runAnonymousConnectProbe() {
+        stopConnectProbe()
+        if (adapter == null || !adapter.isEnabled) {
+            onBleError("Bluetooth off or unavailable")
+            return
+        }
+        if (!hasConnectPermission()) {
+            onBleError("Missing BLUETOOTH_CONNECT / legacy Bluetooth permission")
+            return
+        }
+        stopScan()
+        val built = scanAccumulator.entries
+            .map { (addr, acc) -> addr.uppercase(Locale.US) to acc }
+            .filter { (_, acc) -> acc.displayNameAtBest == "(no name)" && acc.bestRssi > -70 }
+            .sortedByDescending { (_, acc) -> acc.bestRssi }
+            .take(3)
+            .map { (addr, acc) -> addr to acc.bestRssi }
+        if (built.isEmpty()) {
+            logger.w(
+                sessionIdForLogs(),
+                "ble_probe_no_candidates",
+                mapOf(
+                    "accumulatedDevices" to scanAccumulator.size,
+                    "msg" to "No scan hits with name (no name) and RSSI > -70",
+                ),
+            )
+            return
+        }
+        connectProbeList = built
+        connectProbeIndex = 0
+        connectProbeActive = true
+        logger.i(
+            sessionIdForLogs(),
+            "ble_probe_plan",
+            mapOf(
+                "attempts" to built.size,
+                "msg" to built.joinToString { "${it.first} @ ${it.second} dBm" },
+            ),
+        )
+        tryConnectProbeAt(0)
+    }
+
+    private fun tryConnectProbeAt(index: Int) {
+        if (!connectProbeActive) return
+        if (index >= connectProbeList.size) {
+            logger.i(
+                sessionIdForLogs(),
+                "ble_probe_exhausted",
+                mapOf("msg" to "All probe attempts failed or no more candidates"),
+            )
+            stopConnectProbe()
+            return
+        }
+        val (mac, rssi) = connectProbeList[index]
+        connectProbeIndex = index
+        connectProbeAttemptMac = mac
+        connectProbeSawConnectedForAttempt = false
+        connectProbeFailureHandledForAttempt = false
+        logger.i(
+            sessionIdForLogs(),
+            "ble_probe_trying_device",
+            mapOf(
+                "mac" to mac,
+                "rssi" to rssi,
+                "msg" to "Trying device: $mac, RSSI: $rssi",
+            ),
+        )
+        mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
+        mainHandler.postDelayed(connectProbeTimeoutRunnable, PROBE_CONNECT_TIMEOUT_MS)
+        openGattDiscoveryConnection(mac)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openGattDiscoveryConnection(normalizedMac: String) {
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        pendingNotifyCharacteristics.clear()
+        val ad = adapter ?: return
+        val device = try {
+            ad.getRemoteDevice(normalizedMac)
+        } catch (e: IllegalArgumentException) {
+            logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to normalizedMac), e)
+            onBleError("invalid MAC: ${e.message}")
+            return
+        }
+        discoveryMode = true
+        logger.i(
+            sessionIdForLogs(),
+            "ble_connect_attempt",
+            mapOf("address" to normalizedMac),
+        )
+        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            @Suppress("DEPRECATION")
+            device.connectGatt(appContext, false, gattCallback)
+        }
+    }
+
     private fun parseRecordingPayload(bytes: ByteArray) {
         try {
             val text = bytes.toString(Charsets.UTF_8)
@@ -430,6 +717,7 @@ class W1BleGattCoordinator(
      */
     @SuppressLint("MissingPermission")
     fun connectToDevice(macAddress: String) {
+        stopConnectProbe()
         if (adapter == null || !adapter.isEnabled) {
             onBleError("Bluetooth off or unavailable")
             return
@@ -439,33 +727,15 @@ class W1BleGattCoordinator(
             return
         }
         stopScan()
-        try {
-            gatt?.disconnect()
-            gatt?.close()
-        } catch (_: Exception) {
-        }
-        gatt = null
-        pendingNotifyCharacteristics.clear()
         val normalized = macAddress.trim().uppercase(Locale.US)
-        val device = try {
+        try {
             adapter.getRemoteDevice(normalized)
         } catch (e: IllegalArgumentException) {
             logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to macAddress), e)
             onBleError("invalid MAC: ${e.message}")
             return
         }
-        discoveryMode = true
-        logger.i(
-            sessionIdForLogs(),
-            "ble_connect_attempt",
-            mapOf("address" to normalized),
-        )
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            @Suppress("DEPRECATION")
-            device.connectGatt(appContext, false, gattCallback)
-        }
+        openGattDiscoveryConnection(normalized)
     }
 
     @SuppressLint("MissingPermission")
@@ -487,6 +757,7 @@ class W1BleGattCoordinator(
             onBleError("LE scanner unavailable")
             return
         }
+        scanAccumulator.clear()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -504,6 +775,7 @@ class W1BleGattCoordinator(
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        stopConnectProbe()
         discoveryMode = false
         pendingNotifyCharacteristics.clear()
         stopScan()

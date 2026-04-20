@@ -107,6 +107,23 @@ class RealW1DeviceService(
             )
     }
 
+    /** Try GATT connect to strongest unnamed peripherals (RSSI > -70), up to 3 attempts. */
+    fun runAnonymousConnectProbe() {
+        if (coordinator == null) {
+            installEngineHooks()
+            val c = newCoordinator()
+            coordinator = c
+            switchableBle.delegate = W1BleGattTransportImpl(c)
+        }
+        coordinator?.runAnonymousConnectProbe()
+            ?: logger.e(
+                engine.currentState().sessionId.ifEmpty { "ble" },
+                "ble_probe_skipped",
+                mapOf("reason" to "coordinator_null"),
+                null,
+            )
+    }
+
     override fun stop() {
         coordinator?.disconnect()
         coordinator = null
