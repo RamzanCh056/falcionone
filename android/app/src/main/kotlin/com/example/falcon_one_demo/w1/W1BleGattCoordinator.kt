@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanRecord
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -57,18 +58,63 @@ class W1BleGattCoordinator(
     @SuppressLint("MissingPermission")
     private fun logBleDeviceSeen(result: ScanResult) {
         val device = result.device ?: return
-        val advertised = result.scanRecord?.deviceName?.trim()?.takeIf { it.isNotEmpty() }
+        val record = result.scanRecord
+        val advertised = record?.deviceName?.trim()?.takeIf { it.isNotEmpty() }
         val cached = device.name?.trim()?.takeIf { it.isNotEmpty() }
         val name = advertised ?: cached ?: "(no name)"
-        logger.i(
-            sessionIdForLogs(),
-            "ble_device_seen",
-            mapOf(
-                "name" to name,
-                "address" to device.address,
-                "rssi" to result.rssi,
-            ),
+        val fields = mutableMapOf<String, Any?>(
+            "name" to name,
+            "address" to device.address,
+            "rssi" to result.rssi,
         )
+        formatManufacturerData(record)?.let { fields["mfrData"] = it }
+        formatAdvertisedServiceUuids(record)?.let { fields["serviceUuids"] = it }
+        record?.txPowerLevel?.takeIf { it != ScanRecord.TX_POWER_NOT_PRESENT }?.let {
+            fields["txPower"] = it
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            val raw = record?.bytes
+            if (raw != null && raw.isNotEmpty()) {
+                fields["advHex"] = hexPrefix(raw, maxBytes = 31)
+            }
+        }
+        logger.i(sessionIdForLogs(), "ble_device_seen", fields)
+    }
+
+    /** `COMPANY:HEX|…` from AD manufacturer blocks (helps identify devices that use "(no name)"). */
+    private fun formatManufacturerData(record: ScanRecord?): String? {
+        if (record == null) return null
+        @Suppress("DEPRECATION")
+        val mfr = record.manufacturerSpecificData ?: return null
+        if (mfr.size() == 0) return null
+        return buildString {
+            for (i in 0 until mfr.size()) {
+                if (isNotEmpty()) append('|')
+                val id = mfr.keyAt(i) and 0xFFFF
+                val data = mfr.valueAt(i) ?: continue
+                append(String.format("%04X:", id))
+                append(hexPrefix(data, maxBytes = 20))
+            }
+        }.takeIf { it.isNotEmpty() }
+    }
+
+    private fun formatAdvertisedServiceUuids(record: ScanRecord?): String? {
+        val list = record?.serviceUuids ?: return null
+        if (list.isEmpty()) return null
+        return list.asSequence()
+            .take(16)
+            .joinToString(",") { it.uuid.toString() }
+            .take(900)
+    }
+
+    private fun hexPrefix(bytes: ByteArray, maxBytes: Int): String {
+        val n = minOf(bytes.size, maxBytes)
+        val sb = StringBuilder(n * 2 + 1)
+        for (i in 0 until n) {
+            sb.append(String.format("%02X", bytes[i]))
+        }
+        if (bytes.size > maxBytes) sb.append("...")
+        return sb.toString()
     }
 
     @SuppressLint("MissingPermission")
