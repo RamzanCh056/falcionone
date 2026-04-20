@@ -23,7 +23,8 @@ package com.example.falcon_one_demo.w1
  * - Retries: `withRetries` with exponential backoff + jitter.
  *
  * **Log samples (Logcat tag W1)**
- * - `{"event":"ble_scan_start","service":"0000fff0-..."}`
+ * - `{"event":"ble_scan_start","mode":"unfiltered_all_devices"}`
+ * - `{"event":"ble_device_seen","name":"...","address":"...","rssi":-42}`
  * - `{"event":"wifi_bind","network":"100","bindOk":true}`
  * - `{"event":"picked_recording","id":"rec-1","sizeBytes":123456}`
  * - `{"event":"retry","phase":"download","attempt":2,"maxAttempts":4}`

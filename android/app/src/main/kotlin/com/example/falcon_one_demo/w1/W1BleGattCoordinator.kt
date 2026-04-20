@@ -1,7 +1,6 @@
 package com.example.falcon_one_demo.w1
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
@@ -9,20 +8,18 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
-import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.util.UUID
 
 /**
- * BLE scan → connect → enable notifications on [W1DeviceUuids.recordingStatusCharacteristic].
- * Replace UUIDs and payload parsing with W1 vendor spec.
+ * Unfiltered BLE scan (all peripherals) with structured logs per advertisement.
+ * GATT connect/notify still uses [W1DeviceUuids] when a connection path is wired in.
  */
 class W1BleGattCoordinator(
     context: Context,
@@ -38,17 +35,15 @@ class W1BleGattCoordinator(
     private var scanner = adapter?.bluetoothLeScanner
     private var gatt: BluetoothGatt? = null
 
+    @SuppressLint("MissingPermission")
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device ?: return
-            logger.i(sessionIdForLogs(), "ble_scan_hit", mapOf("address" to device.address))
-            stopScan()
-            @SuppressLint("MissingPermission")
-            gatt = if (Build.VERSION.SDK_INT >= 23) {
-                device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-            } else {
-                @Suppress("DEPRECATION")
-                device.connectGatt(appContext, false, gattCallback)
+            logBleDeviceSeen(result)
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>) {
+            for (r in results) {
+                logBleDeviceSeen(r)
             }
         }
 
@@ -56,6 +51,24 @@ class W1BleGattCoordinator(
             logger.e(sessionIdForLogs(), "ble_scan_failed", mapOf("code" to errorCode), null)
             onBleError("scan failed code=$errorCode")
         }
+    }
+
+    /** One log line per advertisement (Logcat + JSON) — unfiltered discovery only; no auto-connect. */
+    @SuppressLint("MissingPermission")
+    private fun logBleDeviceSeen(result: ScanResult) {
+        val device = result.device ?: return
+        val advertised = result.scanRecord?.deviceName?.trim()?.takeIf { it.isNotEmpty() }
+        val cached = device.name?.trim()?.takeIf { it.isNotEmpty() }
+        val name = advertised ?: cached ?: "(no name)"
+        logger.i(
+            sessionIdForLogs(),
+            "ble_device_seen",
+            mapOf(
+                "name" to name,
+                "address" to device.address,
+                "rssi" to result.rssi,
+            ),
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -158,14 +171,11 @@ class W1BleGattCoordinator(
             onBleError("LE scanner unavailable")
             return
         }
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(uuids.service))
-            .build()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        logger.i(sessionIdForLogs(), "ble_scan_start", mapOf("service" to uuids.service.toString()))
-        scanner?.startScan(listOf(filter), settings, scanCallback)
+        logger.i(sessionIdForLogs(), "ble_scan_start", mapOf("mode" to "unfiltered_all_devices"))
+        scanner?.startScan(null, settings, scanCallback)
     }
 
     @SuppressLint("MissingPermission")
