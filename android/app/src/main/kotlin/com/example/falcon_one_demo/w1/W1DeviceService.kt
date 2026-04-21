@@ -107,6 +107,23 @@ class RealW1DeviceService(
             )
     }
 
+    /** Stop scan → short delay → single GATT open with [BluetoothDevice.TRANSPORT_LE] (debug / conflict mitigation). */
+    fun forceBleSafeConnect(macAddress: String) {
+        installEngineHooks()
+        if (coordinator == null) {
+            val c = newCoordinator()
+            coordinator = c
+            switchableBle.delegate = W1BleGattTransportImpl(c)
+        }
+        coordinator?.forceBleSafeConnect(macAddress.trim())
+            ?: logger.e(
+                engine.currentState().sessionId.ifEmpty { "ble" },
+                "ble_force_safe_skipped",
+                mapOf("reason" to "coordinator_null"),
+                null,
+            )
+    }
+
     /** Try GATT connect to strongest unnamed peripherals (RSSI > -70), up to 3 attempts. */
     fun runAnonymousConnectProbe() {
         if (coordinator == null) {

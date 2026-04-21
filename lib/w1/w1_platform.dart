@@ -65,4 +65,18 @@ class W1Platform {
   static Future<String?> exportLogs() async {
     return _method.invokeMethod<String>('exportLogs');
   }
+
+  /// Direct GATT (discovery mode): stop scan → delay → [BluetoothDevice.TRANSPORT_LE], autoConnect false.
+  static Future<void> connectW1Ble({required String macAddress}) async {
+    await _method.invokeMethod<void>('connectW1Ble', <String, dynamic>{
+      'macAddress': macAddress,
+    });
+  }
+
+  /// Debug: stop scan → 500 ms → single GATT open with LE transport; bonded device logged as info only.
+  static Future<void> forceBleSafeConnect({required String macAddress}) async {
+    await _method.invokeMethod<void>('forceBleSafeConnect', <String, dynamic>{
+      'macAddress': macAddress,
+    });
+  }
 }

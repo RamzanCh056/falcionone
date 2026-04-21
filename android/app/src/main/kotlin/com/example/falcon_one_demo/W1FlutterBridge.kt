@@ -4,12 +4,15 @@ import android.os.Handler
 import android.os.Looper
 import com.example.falcon_one_demo.w1.MockW1WifiFileClient
 import com.example.falcon_one_demo.w1.OkHttpW1WifiFileClient
+import com.example.falcon_one_demo.w1.RealW1DeviceService
 import com.example.falcon_one_demo.w1.RemoteRecording
 import com.example.falcon_one_demo.w1.SharedPrefsW1CheckpointStore
 import com.example.falcon_one_demo.w1.W1BleStubTransport
+import com.example.falcon_one_demo.w1.W1DeviceUuids
 import com.example.falcon_one_demo.w1.W1Logger
 import com.example.falcon_one_demo.w1.W1SwitchableBleTransport
 import com.example.falcon_one_demo.w1.W1TransferEngine
+import com.example.falcon_one_demo.w1.W1WifiNetworkBinder
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -53,6 +56,16 @@ object W1FlutterBridge {
             onUiState = { st ->
                 eventSinkRef.get()?.success(st.toMap())
             },
+        )
+
+        val wifiBinder = W1WifiNetworkBinder(ctx, logger)
+        val realW1Device = RealW1DeviceService(
+            appContext = ctx,
+            engine = transferEngine,
+            switchableBle = switchableBle,
+            logger = logger,
+            uuids = W1DeviceUuids(),
+            wifiBinder = wifiBinder,
         )
 
         EventChannel(engine.dartExecutor.binaryMessenger, eventChannelName).setStreamHandler(
@@ -136,6 +149,26 @@ object W1FlutterBridge {
                         val out = ctx.cacheDir.resolve("w1_logs_export.txt")
                         val ok = logger.exportRingToFile(out)
                         result.success(if (ok) out.absolutePath else null)
+                    }
+
+                    "connectW1Ble" -> {
+                        val mac = call.argument<String>("macAddress")?.trim().orEmpty()
+                        if (mac.isEmpty()) {
+                            result.error("W1_ERROR", "macAddress is required", null)
+                        } else {
+                            realW1Device.connectToDevice(mac)
+                            result.success(null)
+                        }
+                    }
+
+                    "forceBleSafeConnect" -> {
+                        val mac = call.argument<String>("macAddress")?.trim().orEmpty()
+                        if (mac.isEmpty()) {
+                            result.error("W1_ERROR", "macAddress is required", null)
+                        } else {
+                            realW1Device.forceBleSafeConnect(mac)
+                            result.success(null)
+                        }
                     }
 
                     else -> result.notImplemented()
