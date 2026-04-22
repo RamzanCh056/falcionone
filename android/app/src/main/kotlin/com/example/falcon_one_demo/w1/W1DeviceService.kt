@@ -73,7 +73,7 @@ class RealW1DeviceService(
                     engine.currentState().sessionId.ifEmpty { "ble" },
                     "ble_error",
                     mapOf("message" to msg),
-                    IllegalStateException(msg),
+                    null,
                 )
             },
             onBleScanUi = onBleScanUi,

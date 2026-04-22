@@ -2,6 +2,7 @@ package com.example.falcon_one_demo.w1
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -13,7 +14,10 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanRecord
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -88,6 +92,13 @@ class W1BleGattCoordinator(
 
     private data class ScanAgg(var bestRssi: Int, var displayNameAtBest: String)
 
+    private data class PendingBtRetry(
+        val mac: String,
+        val localName: String?,
+        val bondPairingConflictWarn: Boolean,
+        val forceSafeConnectPath: Boolean,
+    )
+
     private val scanAccumulator = ConcurrentHashMap<String, ScanAgg>()
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -116,6 +127,9 @@ class W1BleGattCoordinator(
     private var diagnosticScanTimeoutRunnable: Runnable? = null
     private val scanConnectGattWatchdogRunnable = Runnable { onScanConnectGattWatchdogTimeout() }
 
+    private var pendingBtOnAutoRetry: PendingBtRetry? = null
+    private var bluetoothPowerStateReceiver: BroadcastReceiver? = null
+
     private var scanConnectFilteredTimeoutsWithoutMatch: Int = 0
     private var scanConnectDiagnosticDone: Boolean = false
     private var scanConnectDiagnosticScanActive: Boolean = false
@@ -129,6 +143,44 @@ class W1BleGattCoordinator(
         } catch (_: Exception) {
         }
     }
+
+    private fun ensureBluetoothPowerStateReceiverRegistered() {
+        if (bluetoothPowerStateReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                if (state != BluetoothAdapter.STATE_ON) return
+                val snapshot = pendingBtOnAutoRetry ?: return
+                mainHandler.post {
+                    beginW1ScanBasedConnect(
+                        macAddress = snapshot.mac,
+                        localNameHint = snapshot.localName,
+                        bondPairingConflictWarn = snapshot.bondPairingConflictWarn,
+                        forceSafeConnectPath = snapshot.forceSafeConnectPath,
+                    )
+                }
+            }
+        }
+        bluetoothPowerStateReceiver = receiver
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            appContext.registerReceiver(receiver, filter)
+        }
+    }
+
+    private fun unregisterBluetoothPowerStateReceiver() {
+        val r = bluetoothPowerStateReceiver ?: return
+        try {
+            appContext.unregisterReceiver(r)
+        } catch (_: Exception) {
+        }
+        bluetoothPowerStateReceiver = null
+    }
+
     private var scanner = adapter?.bluetoothLeScanner
     private var gatt: BluetoothGatt? = null
 
@@ -320,7 +372,30 @@ class W1BleGattCoordinator(
     private fun enterScanPhaseForConnect() {
         if (!scanConnectSessionActive) return
         if (adapter == null || !adapter.isEnabled) {
-            onBleError("Bluetooth off or unavailable")
+            val mac = scanConnectTargetMac
+            if (mac != null) {
+                pendingBtOnAutoRetry = PendingBtRetry(
+                    mac = mac,
+                    localName = scanConnectTargetLocalName,
+                    bondPairingConflictWarn = scanConnectBondPairingConflictWarn,
+                    forceSafeConnectPath = scanConnectForceSafePath,
+                )
+                ensureBluetoothPowerStateReceiverRegistered()
+                emitBleScanUi(
+                    mapOf(
+                        "phase" to "bluetooth_off",
+                        "detail" to "Bluetooth is off",
+                        "userHint" to "Enable Bluetooth on this device. Connection will retry automatically when Bluetooth turns on, or tap Retry.",
+                    ),
+                )
+            }
+            logger.e(
+                sessionIdForLogs(),
+                "ble_bluetooth_off",
+                mapOf("msg" to "Bluetooth is off — cannot continue BLE scan"),
+                null,
+            )
+            onBleError("Bluetooth is off. Please enable Bluetooth and try again.")
             cancelScanConnectSession()
             return
         }
@@ -410,12 +485,38 @@ class W1BleGattCoordinator(
         bondPairingConflictWarn: Boolean,
         forceSafeConnectPath: Boolean,
     ) {
-        stopConnectProbe()
-        cancelScanConnectSession()
-        if (adapter == null || !adapter.isEnabled) {
-            onBleError("Bluetooth off or unavailable")
+        val bluetoothManager = appContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val currentAdapter = bluetoothManager?.adapter
+        if (currentAdapter == null || !currentAdapter.isEnabled) {
+            stopConnectProbe()
+            cancelScanConnectSession()
+            logger.e(
+                sessionIdForLogs(),
+                "ble_bluetooth_off",
+                mapOf("msg" to "Bluetooth is off — cannot start BLE scan"),
+                null,
+            )
+            pendingBtOnAutoRetry = PendingBtRetry(
+                mac = macAddress.trim().uppercase(Locale.US),
+                localName = localNameHint,
+                bondPairingConflictWarn = bondPairingConflictWarn,
+                forceSafeConnectPath = forceSafeConnectPath,
+            )
+            ensureBluetoothPowerStateReceiverRegistered()
+            emitBleScanUi(
+                mapOf(
+                    "phase" to "bluetooth_off",
+                    "detail" to "Bluetooth is off",
+                    "userHint" to "Enable Bluetooth on this device. Connection will retry automatically when Bluetooth turns on, or tap Retry.",
+                ),
+            )
+            onBleError("Bluetooth is off. Please enable Bluetooth and try again.")
             return
         }
+        pendingBtOnAutoRetry = null
+        unregisterBluetoothPowerStateReceiver()
+        stopConnectProbe()
+        cancelScanConnectSession()
         if (!hasConnectPermission()) {
             onBleError("Missing BLUETOOTH_CONNECT / legacy Bluetooth permission")
             return
@@ -1162,7 +1263,13 @@ class W1BleGattCoordinator(
     fun runAnonymousConnectProbe() {
         stopConnectProbe()
         if (adapter == null || !adapter.isEnabled) {
-            onBleError("Bluetooth off or unavailable")
+            logger.e(
+                sessionIdForLogs(),
+                "ble_bluetooth_off",
+                mapOf("msg" to "Bluetooth is off — anonymous probe skipped"),
+                null,
+            )
+            onBleError("Bluetooth is off. Please enable Bluetooth and try again.")
             return
         }
         if (!hasConnectPermission()) {
@@ -1462,7 +1569,13 @@ class W1BleGattCoordinator(
         cancelScanConnectSession()
         emitBleScanUi(mapOf("phase" to "idle", "detail" to "Background discovery scan (connect session cancelled)"))
         if (adapter == null || !adapter.isEnabled) {
-            onBleError("Bluetooth off or unavailable")
+            logger.e(
+                sessionIdForLogs(),
+                "ble_bluetooth_off",
+                mapOf("msg" to "Bluetooth is off — background scan not started"),
+                null,
+            )
+            onBleError("Bluetooth is off. Please enable Bluetooth and try again.")
             return
         }
         if (!hasConnectPermission()) {
@@ -1496,6 +1609,8 @@ class W1BleGattCoordinator(
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        pendingBtOnAutoRetry = null
+        unregisterBluetoothPowerStateReceiver()
         stopConnectProbe()
         cancelScanConnectSession()
         emitBleScanUi(mapOf("phase" to "idle", "detail" to "Disconnected"))

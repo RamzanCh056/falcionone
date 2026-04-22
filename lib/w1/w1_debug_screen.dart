@@ -14,6 +14,14 @@ class W1DebugScreen extends StatefulWidget {
   State<W1DebugScreen> createState() => _W1DebugScreenState();
 }
 
+bool _isBluetoothOffBleError(String? text) {
+  if (text == null || text.isEmpty) return false;
+  final t = text.toLowerCase();
+  return t.contains('bluetooth off') ||
+      t.contains('bluetooth is off') ||
+      t.contains('bluetooth unavailable');
+}
+
 class _W1DebugScreenState extends State<W1DebugScreen> {
   StreamSubscription<Map<dynamic, dynamic>>? _sub;
   StreamSubscription<Map<dynamic, dynamic>>? _bleScanSub;
@@ -140,6 +148,9 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     }
   }
 
+  static const String _kBluetoothOffUserMessage =
+      '📵 Bluetooth is off. Please enable Bluetooth on your phone, then tap Retry.';
+
   Widget _bleScanStatusCard(BuildContext context) {
     final phase = _bleScanUi['phase']?.toString() ?? '';
     const visiblePhases = <String>{
@@ -149,6 +160,7 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
       'connecting',
       'connected',
       'exhausted',
+      'bluetooth_off',
     };
     if (!visiblePhases.contains(phase)) return const SizedBox.shrink();
     final detail = _bleScanUi['detail']?.toString() ?? '';
@@ -156,7 +168,8 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     final attempt = _bleScanUi['attempt'];
     final maxA = _bleScanUi['maxAttempts'];
     final exhausted = phase == 'exhausted';
-    final Color bg = exhausted
+    final bluetoothOff = phase == 'bluetooth_off';
+    final Color bg = exhausted || bluetoothOff
         ? Theme.of(context).colorScheme.errorContainer.withValues(alpha: 0.35)
         : phase == 'connected'
         ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.4)
@@ -172,8 +185,9 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
           children: [
             Text('BLE scan / connect', style: Theme.of(context).textTheme.titleSmall),
             const SizedBox(height: 6),
-            if (detail.isNotEmpty) Text(detail),
-            if (hint != null && hint.isNotEmpty && hint != detail) ...[
+            if (bluetoothOff) Text(_kBluetoothOffUserMessage),
+            if (!bluetoothOff && detail.isNotEmpty) Text(detail),
+            if (!bluetoothOff && hint != null && hint.isNotEmpty && hint != detail) ...[
               const SizedBox(height: 4),
               Text(hint),
             ],
@@ -187,6 +201,14 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
                 onPressed: () => _runW1BleConnect(forceSafe: false),
                 icon: const Icon(Icons.refresh),
                 label: const Text('Retry scan → connect'),
+              ),
+            ],
+            if (bluetoothOff) ...[
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: () => _runW1BleConnect(forceSafe: false),
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
               ),
             ],
           ],
@@ -222,7 +244,19 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
           ],
           if (err != null && err.isNotEmpty) ...[
             const SizedBox(height: 8),
-            Text('Error: $err', style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            if (_isBluetoothOffBleError(err)) ...[
+              Text(
+                _kBluetoothOffUserMessage,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.icon(
+                onPressed: () => _runW1BleConnect(forceSafe: false),
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+            ] else
+              Text('Error: $err', style: TextStyle(color: Theme.of(context).colorScheme.error)),
           ],
           const Divider(height: 32),
           TextField(
