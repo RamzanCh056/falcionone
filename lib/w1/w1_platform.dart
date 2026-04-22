@@ -66,17 +66,27 @@ class W1Platform {
     return _method.invokeMethod<String>('exportLogs');
   }
 
-  /// Direct GATT (discovery mode): stop scan → delay → [BluetoothDevice.TRANSPORT_LE], autoConnect false.
-  static Future<void> connectW1Ble({required String macAddress}) async {
+  /// Native GATT: LE scan (15 s) for [macAddress] or [localName], then teardown + 500 ms → connectGatt (TRANSPORT_LE).
+  /// Omit [localName] to use default `SSJ-ZXAN9A1`; pass empty string for MAC-only matching.
+  /// [localName] defaults to `SSJ-ZXAN9A1`; pass empty string for MAC-only scan match.
+  static Future<void> connectW1Ble({
+    required String macAddress,
+    String localName = 'SSJ-ZXAN9A1',
+  }) async {
     await _method.invokeMethod<void>('connectW1Ble', <String, dynamic>{
       'macAddress': macAddress,
+      'localName': localName,
     });
   }
 
-  /// Debug: stop scan → 500 ms → single GATT open with LE transport; bonded device logged as info only.
-  static Future<void> forceBleSafeConnect({required String macAddress}) async {
+  /// Same scan→connect path with relaxed bonded warning (debug).
+  static Future<void> forceBleSafeConnect({
+    required String macAddress,
+    String localName = 'SSJ-ZXAN9A1',
+  }) async {
     await _method.invokeMethod<void>('forceBleSafeConnect', <String, dynamic>{
       'macAddress': macAddress,
+      'localName': localName,
     });
   }
 }

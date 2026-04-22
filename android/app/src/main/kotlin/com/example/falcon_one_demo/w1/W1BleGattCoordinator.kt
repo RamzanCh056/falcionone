@@ -2,7 +2,6 @@ package com.example.falcon_one_demo.w1
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -14,10 +13,7 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanRecord
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -31,7 +27,13 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Unfiltered BLE scan (all peripherals) with structured logs per advertisement.
- * [connectToDevice] runs a discovery-only GATT session (log all services/characteristics; optional notifies).
+ *
+ * **W1 GATT connect** mirrors the usual FlutterBluePlus-style flow (this app uses native Android BLE, not FBP):
+ * start LE scan (15 s) → match **MAC** or **local name** → stop scan → GATT teardown + 500 ms →
+ * [BluetoothDevice.connectGatt] on the **scanned** [BluetoothDevice] (TRANSPORT_LE, autoConnect false) →
+ * on [BluetoothProfile.STATE_CONNECTED] with [BluetoothGatt.GATT_SUCCESS] → [BluetoothGatt.discoverServices] →
+ * on early disconnect / watchdog: wait 2 s → full scan again (no direct MAC-only reconnect).
+ *
  * Legacy vendor UUID handling remains behind [discoveryMode] == false for future workflows.
  */
 class W1BleGattCoordinator(
@@ -54,18 +56,23 @@ class W1BleGattCoordinator(
         private const val PROBE_CONNECT_TIMEOUT_MS = 15_000L
         private const val PROBE_RETRY_DELAY_MS = 450L
 
-        /** After [stopScan], delay before first [connectGatt] (stabilize stack; target 300–800 ms). */
-        private const val POST_SCAN_TO_GATT_DELAY_MS = 550L
+        /** Default W1 advertised / GAP local name (match is case-insensitive). */
+        private const val DEFAULT_W1_BLE_LOCAL_NAME = "SSJ-ZXAN9A1"
 
-        private const val FORCE_BLE_SAFE_POST_SCAN_MS = 500L
-        private const val DIRECT_GATT_STATE_WATCHDOG_MS = 5_000L
-        private const val MAX_DIRECT_GATT_CONNECT_OPENS = 3
+        /** LE scan window when resolving a connectable advertisement before GATT (FlutterBluePlus-style timeout). */
+        private const val SCAN_FOR_CONNECT_TIMEOUT_MS = 15_000L
 
-        /** Delay between GATT open retries when adapter is on (1–2 s). */
-        private const val DIRECT_CONNECT_RETRY_GAP_MS = 1_200L
+        /** After a failed GATT session, wait before starting a fresh scan (no direct MAC reconnect). */
+        private const val SCAN_CONNECT_DISCONNECT_RETRY_MS = 2_000L
 
-        /** After Bluetooth adapter OFF → ON, wait before opening GATT again. */
-        private const val ADAPTER_ON_STABILIZE_MS = 1_500L
+        /** GATT teardown ([disconnect]/[close]) before each [connectGatt] (stale handle cleanup). */
+        private const val GATT_CLEANUP_BEFORE_CONNECT_MS = 500L
+
+        /** Max number of scan cycles (each can include one GATT attempt) before giving up. */
+        private const val MAX_SCAN_CONNECT_CYCLES = 6
+
+        /** If no CONNECTED within this window after [connectGatt], close and restart scan flow. */
+        private const val SCAN_CONNECT_GATT_WATCHDOG_MS = 32_000L
     }
 
     private data class ScanAgg(var bestRssi: Int, var displayNameAtBest: String)
@@ -84,19 +91,18 @@ class W1BleGattCoordinator(
     private var probeAdvanceRunnable: Runnable? = null
     private val probeLock = Any()
 
-    /** Direct [connectToDevice]: delay after stopScan, 5s watchdog per open, up to 3 connectGatt opens. */
-    private var directGattReliabilityActive: Boolean = false
-    private var directGattReliabilityMac: String? = null
-    private var directGattOpenCount: Int = 0
-    private var directGattSawConnectedThisOpen: Boolean = false
-    private var directGattFailureHandledThisOpen: Boolean = false
-    private var postScanToGattRunnable: Runnable? = null
-    private val directGattWatchdogRunnable = Runnable { onDirectGattWatchdogTimeout() }
-    private var directGattRetryRunnable: Runnable? = null
-    private val directGattLock = Any()
-
-    private var bluetoothAdapterStateReceiver: BroadcastReceiver? = null
-    private var awaitingAdapterOnForGattRetry: Boolean = false
+    /** Scan-first connect session ([connectToDevice] / [forceBleSafeConnect]); no direct MAC-only GATT for W1. */
+    private var scanConnectSessionActive: Boolean = false
+    private var scanConnectAwaitingAdvertisement: Boolean = false
+    private var scanConnectTargetMac: String? = null
+    private var scanConnectTargetLocalName: String? = null
+    private var scanConnectBondPairingConflictWarn: Boolean = true
+    private var scanConnectForceSafePath: Boolean = false
+    private var scanConnectAutoRetryEnabled: Boolean = false
+    private var scanConnectAttemptNumber: Int = 0
+    private var scanForConnectTimeoutRunnable: Runnable? = null
+    private var scanConnectDisconnectRetryRunnable: Runnable? = null
+    private val scanConnectGattWatchdogRunnable = Runnable { onScanConnectGattWatchdogTimeout() }
 
     private val appContext = context.applicationContext
     private val adapter = (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -150,6 +156,7 @@ class W1BleGattCoordinator(
         }
         logger.i(sessionIdForLogs(), "ble_device_seen", fields)
         recordScanSample(device.address, result.rssi, name)
+        maybeOfferScanConnectCandidate(result)
     }
 
     private fun recordScanSample(address: String, rssi: Int, displayName: String) {
@@ -161,6 +168,260 @@ class W1BleGattCoordinator(
                 old
             }
         }
+    }
+
+    private fun deviceMatchesScanConnectTarget(device: BluetoothDevice, record: ScanRecord?): Boolean {
+        val mac = scanConnectTargetMac ?: return false
+        if (device.address.equals(mac, ignoreCase = true)) return true
+        val hint = scanConnectTargetLocalName ?: return false
+        if (hint.isEmpty()) return false
+        val adv = record?.deviceName?.trim()?.takeIf { it.isNotEmpty() }
+        val cached = device.name?.trim()?.takeIf { it.isNotEmpty() }
+        val resolved = adv ?: cached ?: return false
+        return resolved.equals(hint, ignoreCase = true)
+    }
+
+    private fun maybeOfferScanConnectCandidate(result: ScanResult) {
+        if (!scanConnectSessionActive || !scanConnectAwaitingAdvertisement) return
+        val device = result.device ?: return
+        val record = result.scanRecord
+        if (!deviceMatchesScanConnectTarget(device, record)) return
+        mainHandler.post { commitScanConnectTargetFound(device) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun commitScanConnectTargetFound(device: BluetoothDevice) {
+        if (!scanConnectSessionActive || !scanConnectAwaitingAdvertisement) return
+        scanConnectAwaitingAdvertisement = false
+        scanForConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        scanForConnectTimeoutRunnable = null
+        stopScan()
+        logger.i(
+            sessionIdForLogs(),
+            "ble_scan_connect_target_found",
+            mapOf(
+                "address" to device.address,
+                "bondState" to device.bondState,
+                "bondStateName" to bondStateName(device.bondState),
+                "msg" to "Matched scan result; stopping scan before GATT (scanned device object, not remote MAC only)",
+            ),
+        )
+        val captured = device
+        gattCleanupBeforeConnectRunnable(
+            Runnable {
+                if (!scanConnectSessionActive) return@Runnable
+                openGattDiscoveryConnectionFromScanResult(
+                    captured,
+                    logBleConnectAttempt = true,
+                    bondPairingConflictWarn = scanConnectBondPairingConflictWarn,
+                    forceSafeConnectPath = scanConnectForceSafePath,
+                )
+            },
+        )
+    }
+
+    private fun gattCleanupBeforeConnectRunnable(then: Runnable) {
+        try {
+            gatt?.disconnect()
+        } catch (_: Exception) {
+        }
+        try {
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        pendingNotifyCharacteristics.clear()
+        mainHandler.postDelayed(then, GATT_CLEANUP_BEFORE_CONNECT_MS)
+    }
+
+    private fun cancelScanConnectDelayedRunnables() {
+        scanForConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        scanForConnectTimeoutRunnable = null
+        scanConnectDisconnectRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        scanConnectDisconnectRetryRunnable = null
+        mainHandler.removeCallbacks(scanConnectGattWatchdogRunnable)
+    }
+
+    private fun cancelScanConnectSession() {
+        cancelScanConnectDelayedRunnables()
+        scanConnectSessionActive = false
+        scanConnectAwaitingAdvertisement = false
+        scanConnectAutoRetryEnabled = false
+        scanConnectTargetMac = null
+        scanConnectTargetLocalName = null
+        scanConnectAttemptNumber = 0
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enterScanPhaseForConnect() {
+        if (!scanConnectSessionActive) return
+        if (adapter == null || !adapter.isEnabled) {
+            onBleError("Bluetooth off or unavailable")
+            cancelScanConnectSession()
+            return
+        }
+        scanConnectAttemptNumber++
+        if (scanConnectAttemptNumber > MAX_SCAN_CONNECT_CYCLES) {
+            onBleError("BLE scan/connect exhausted after $MAX_SCAN_CONNECT_CYCLES attempts")
+            cancelScanConnectSession()
+            return
+        }
+        scanConnectAwaitingAdvertisement = true
+        stopScan()
+        scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            onBleError("LE scanner unavailable")
+            cancelScanConnectSession()
+            return
+        }
+        val timeout = Runnable {
+            scanForConnectTimeoutRunnable = null
+            if (!scanConnectSessionActive || !scanConnectAwaitingAdvertisement) return@Runnable
+            scanConnectAwaitingAdvertisement = false
+            stopScan()
+            logger.w(
+                sessionIdForLogs(),
+                "ble_scan_connect_timeout",
+                mapOf(
+                    "timeoutMs" to SCAN_FOR_CONNECT_TIMEOUT_MS,
+                    "mac" to (scanConnectTargetMac ?: ""),
+                    "localName" to (scanConnectTargetLocalName ?: ""),
+                    "msg" to "No advertisement from target within scan window — device must be advertising",
+                ),
+            )
+            scheduleScanConnectFullRecovery(reason = "scan_timeout")
+        }
+        scanForConnectTimeoutRunnable = timeout
+        mainHandler.postDelayed(timeout, SCAN_FOR_CONNECT_TIMEOUT_MS)
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        logger.i(
+            sessionIdForLogs(),
+            "ble_scan_for_connect_start",
+            mapOf(
+                "attempt" to scanConnectAttemptNumber,
+                "maxAttempts" to MAX_SCAN_CONNECT_CYCLES,
+                "timeoutMs" to SCAN_FOR_CONNECT_TIMEOUT_MS,
+                "mac" to (scanConnectTargetMac ?: ""),
+                "localName" to (scanConnectTargetLocalName ?: ""),
+            ),
+        )
+        scanner?.startScan(null, settings, scanCallback)
+    }
+
+    private fun beginW1ScanBasedConnect(
+        macAddress: String,
+        localNameHint: String?,
+        bondPairingConflictWarn: Boolean,
+        forceSafeConnectPath: Boolean,
+    ) {
+        stopConnectProbe()
+        cancelScanConnectSession()
+        if (adapter == null || !adapter.isEnabled) {
+            onBleError("Bluetooth off or unavailable")
+            return
+        }
+        if (!hasConnectPermission()) {
+            onBleError("Missing BLUETOOTH_CONNECT / legacy Bluetooth permission")
+            return
+        }
+        if (!hasScanPermission()) {
+            onBleError("Missing BLUETOOTH_SCAN / legacy scan permission")
+            return
+        }
+        if (!hasLocationPermissionForBle()) {
+            logger.w(
+                sessionIdForLogs(),
+                "ble_connect_location_permission",
+                mapOf("msg" to "No ACCESS_FINE/COARSE_LOCATION grant; BLE may be unreliable on some devices"),
+            )
+        }
+        if (!isSystemLocationEnabled()) {
+            logger.w(
+                sessionIdForLogs(),
+                "ble_connect_location_services_off",
+                mapOf("msg" to "System location is OFF; turn Location ON for reliable BLE on many OEMs"),
+            )
+        }
+        val normalized = macAddress.trim().uppercase(Locale.US)
+        try {
+            adapter.getRemoteDevice(normalized)
+        } catch (e: IllegalArgumentException) {
+            logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to macAddress), e)
+            onBleError("invalid MAC: ${e.message}")
+            return
+        }
+        scanConnectSessionActive = true
+        scanConnectTargetMac = normalized
+        scanConnectTargetLocalName = localNameHint?.trim()?.takeIf { it.isNotEmpty() }
+        scanConnectBondPairingConflictWarn = bondPairingConflictWarn
+        scanConnectForceSafePath = forceSafeConnectPath
+        scanConnectAutoRetryEnabled = true
+        scanConnectAttemptNumber = 0
+        logger.i(
+            sessionIdForLogs(),
+            "ble_scan_connect_flow_start",
+            mapOf(
+                "mac" to normalized,
+                "localName" to (scanConnectTargetLocalName ?: ""),
+                "msg" to "GATT cleanup then LE scan → connect using scanned BluetoothDevice",
+            ),
+        )
+        gattCleanupBeforeConnectRunnable(Runnable { enterScanPhaseForConnect() })
+    }
+
+    private fun scheduleScanConnectFullRecovery(reason: String) {
+        if (!scanConnectSessionActive || !scanConnectAutoRetryEnabled) {
+            cancelScanConnectSession()
+            return
+        }
+        scanConnectDisconnectRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable {
+            scanConnectDisconnectRetryRunnable = null
+            if (!scanConnectSessionActive || !scanConnectAutoRetryEnabled) return@Runnable
+            logger.i(
+                sessionIdForLogs(),
+                "ble_scan_connect_recovery",
+                mapOf("reason" to reason, "delayMs" to SCAN_CONNECT_DISCONNECT_RETRY_MS),
+            )
+            gattCleanupBeforeConnectRunnable(Runnable { enterScanPhaseForConnect() })
+        }
+        scanConnectDisconnectRetryRunnable = r
+        mainHandler.postDelayed(r, SCAN_CONNECT_DISCONNECT_RETRY_MS)
+    }
+
+    private fun onScanConnectGattWatchdogTimeout() {
+        if (!scanConnectSessionActive || !scanConnectAutoRetryEnabled) return
+        logger.w(
+            sessionIdForLogs(),
+            "ble_scan_connect_gatt_watchdog",
+            mapOf(
+                "timeoutMs" to SCAN_CONNECT_GATT_WATCHDOG_MS,
+                "msg" to "No stable GATT connection within watchdog; closing and restarting scan flow",
+            ),
+        )
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        scheduleScanConnectFullRecovery(reason = "gatt_watchdog")
+    }
+
+    private fun markScanConnectGattReady() {
+        cancelScanConnectDelayedRunnables()
+        scanConnectAutoRetryEnabled = false
+        scanConnectSessionActive = false
+        scanConnectAwaitingAdvertisement = false
+        scanConnectTargetMac = null
+        scanConnectTargetLocalName = null
+        logger.i(
+            sessionIdForLogs(),
+            "ble_scan_connect_ready",
+            mapOf("msg" to "GATT services discovered; scan→connect session complete"),
+        )
     }
 
     /** `COMPANY:HEX|…` from AD manufacturer blocks (helps identify devices that use "(no name)"). */
@@ -225,7 +486,7 @@ class W1BleGattCoordinator(
                     "newState" to newState,
                     "newStateName" to stateName,
                     "discoveryMode" to discoveryMode,
-                    "directGattReliabilityActive" to directGattReliabilityActive,
+                    "scanConnectSessionActive" to scanConnectSessionActive,
                 ),
             )
             logger.i(
@@ -240,34 +501,40 @@ class W1BleGattCoordinator(
                 ),
             )
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                val skipFromDirectReliability = handleDirectGattReliabilityOnConnected(gatt, status)
-                if (skipFromDirectReliability) {
-                    return
-                }
                 val skipPostConnectWork = handleConnectProbeConnected(gatt, status)
                 if (skipPostConnectWork) {
                     return
                 }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    mainHandler.removeCallbacks(scanConnectGattWatchdogRunnable)
                     logger.i(
                         sessionIdForLogs(),
                         "ble_gatt_connected",
                         mapOf("device" to gatt.device.address),
                     )
+                    onPipeline(W1PipelineState.BLUETOOTH_CONNECTED, "GATT connected")
+                    val started = gatt.discoverServices()
+                    logger.i(
+                        sessionIdForLogs(),
+                        "ble_gatt_discover_services_requested",
+                        mapOf("started" to started),
+                    )
                 } else {
                     logger.w(
                         sessionIdForLogs(),
                         "ble_gatt_connected_nonzero_status",
-                        mapOf("device" to gatt.device.address, "status" to status),
+                        mapOf(
+                            "device" to gatt.device.address,
+                            "status" to status,
+                            "statusLabel" to gattStatusLabel(status),
+                            "msg" to "Skipping discoverServices until GATT_SUCCESS",
+                        ),
+                    )
+                    maybeScheduleScanConnectRecoveryFromConnection(
+                        reason = "connected_non_success_status",
+                        disconnectFirst = true,
                     )
                 }
-                onPipeline(W1PipelineState.BLUETOOTH_CONNECTED, "GATT connected")
-                val started = gatt.discoverServices()
-                logger.i(
-                    sessionIdForLogs(),
-                    "ble_gatt_discover_services_requested",
-                    mapOf("started" to started),
-                )
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 logger.i(
                     sessionIdForLogs(),
@@ -279,7 +546,6 @@ class W1BleGattCoordinator(
                         "reason" to "DISCONNECTED",
                     ),
                 )
-                val suppressIdle = handleDirectGattReliabilityOnDisconnected(gatt, status)
                 handleConnectProbeDisconnected(gatt, status)
                 pendingNotifyCharacteristics.clear()
                 logger.i(
@@ -287,6 +553,7 @@ class W1BleGattCoordinator(
                     "ble_gatt_disconnected",
                     mapOf("device" to gatt.device.address, "status" to status),
                 )
+                val suppressIdle = maybeScheduleScanConnectRecoveryOnDisconnect(gatt, status)
                 if (!suppressIdle) {
                     onPipeline(W1PipelineState.IDLE, "GATT disconnected")
                 }
@@ -302,6 +569,7 @@ class W1BleGattCoordinator(
                     null,
                 )
                 onBleError("service discovery status=$status")
+                maybeScheduleScanConnectRecoveryFromConnection(reason = "service_discovery_failed", disconnectFirst = false)
                 return
             }
             logger.i(
@@ -312,6 +580,9 @@ class W1BleGattCoordinator(
             if (discoveryMode) {
                 logAllGattStructure(gatt)
                 beginNotifyEnableQueue(gatt)
+                if (scanConnectSessionActive) {
+                    markScanConnectGattReady()
+                }
             } else {
                 legacyEnableRecordingNotifications(gatt)
             }
@@ -371,75 +642,8 @@ class W1BleGattCoordinator(
         0x16 -> "GATT_CONN_TERMINATE_LOCAL_HOST" // 22
         0x15 -> "GATT_CONN_TERMINATE_PEER_USER" // 21
         133 -> "GATT_STATUS_133"
+        0x93 -> "GATT_CONN_TIMEOUT_OEM" // 147 — common ~30s Android stack timeout
         else -> "STATUS_0x${Integer.toHexString(status)}"
-    }
-
-    private fun cancelDirectGattReliabilityCallbacks() {
-        postScanToGattRunnable?.let { mainHandler.removeCallbacks(it) }
-        postScanToGattRunnable = null
-        cancelDirectGattWatchdogAndRetryRunnables()
-    }
-
-    private fun cancelDirectGattWatchdogAndRetryRunnables() {
-        mainHandler.removeCallbacks(directGattWatchdogRunnable)
-        directGattRetryRunnable?.let { mainHandler.removeCallbacks(it) }
-        directGattRetryRunnable = null
-    }
-
-    private fun cancelDirectGattReliabilitySession() {
-        cancelDirectGattReliabilityCallbacks()
-        awaitingAdapterOnForGattRetry = false
-        unregisterBluetoothAdapterStateReceiver()
-        directGattReliabilityActive = false
-        directGattReliabilityMac = null
-        directGattOpenCount = 0
-        directGattSawConnectedThisOpen = false
-        directGattFailureHandledThisOpen = false
-    }
-
-    private fun ensureBluetoothAdapterStateReceiverRegistered() {
-        if (bluetoothAdapterStateReceiver != null) return
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
-                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                if (!awaitingAdapterOnForGattRetry || !directGattReliabilityActive) return
-                if (state != BluetoothAdapter.STATE_ON) return
-                awaitingAdapterOnForGattRetry = false
-                logger.i(
-                    sessionIdForLogs(),
-                    "ble_adapter_stabilize_after_on",
-                    mapOf(
-                        "delayMs" to ADAPTER_ON_STABILIZE_MS,
-                        "msg" to "Bluetooth adapter ON; delaying before next GATT open",
-                    ),
-                )
-                mainHandler.postDelayed(
-                    {
-                        if (!directGattReliabilityActive || directGattReliabilityMac == null) return@postDelayed
-                        openNextDirectGattReliabilityOpen()
-                    },
-                    ADAPTER_ON_STABILIZE_MS,
-                )
-            }
-        }
-        bluetoothAdapterStateReceiver = receiver
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            appContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            appContext.registerReceiver(receiver, filter)
-        }
-    }
-
-    private fun unregisterBluetoothAdapterStateReceiver() {
-        val r = bluetoothAdapterStateReceiver ?: return
-        try {
-            appContext.unregisterReceiver(r)
-        } catch (_: Exception) {
-        }
-        bluetoothAdapterStateReceiver = null
     }
 
     private fun bondStateName(bondState: Int): String = when (bondState) {
@@ -465,201 +669,32 @@ class W1BleGattCoordinator(
             PackageManager.PERMISSION_GRANTED
     }
 
-    /** @return true to skip discoverServices / rest of connected branch. */
-    private fun handleDirectGattReliabilityOnConnected(gatt: BluetoothGatt, status: Int): Boolean {
-        if (!directGattReliabilityActive) return false
-        val target = directGattReliabilityMac ?: return false
-        if (!gatt.device.address.equals(target, ignoreCase = true)) return false
-        mainHandler.removeCallbacks(directGattWatchdogRunnable)
-        if (status != BluetoothGatt.GATT_SUCCESS) {
-            val take = synchronized(directGattLock) {
-                if (directGattFailureHandledThisOpen) false
-                else {
-                    directGattFailureHandledThisOpen = true
-                    true
-                }
-            }
-            if (!take) return true
-            logger.w(
-                sessionIdForLogs(),
-                "connect_retry",
-                mapOf(
-                    "reason" to "status_not_gatt_success",
-                    "mac" to target,
-                    "status" to status,
-                    "statusLabel" to gattStatusLabel(status),
-                    "msg" to "STATE_CONNECTED but status != GATT_SUCCESS; will retry if attempts remain",
-                ),
-            )
-            try {
-                gatt.disconnect()
-                gatt.close()
-            } catch (_: Exception) {
-            }
-            this@W1BleGattCoordinator.gatt = null
-            scheduleDirectGattRetryOrExhaust()
-            return true
-        }
-        directGattSawConnectedThisOpen = true
-        directGattReliabilityActive = false
-        cancelDirectGattReliabilityCallbacks()
-        return false
-    }
-
-    /** @return true to skip posting IDLE (inter-attempt disconnect). */
-    private fun handleDirectGattReliabilityOnDisconnected(gatt: BluetoothGatt, status: Int): Boolean {
-        if (!directGattReliabilityActive) return false
-        val target = directGattReliabilityMac ?: return false
-        if (!gatt.device.address.equals(target, ignoreCase = true)) return false
-        if (directGattSawConnectedThisOpen) return false
-        val take = synchronized(directGattLock) {
-            if (directGattFailureHandledThisOpen) false
-            else {
-                directGattFailureHandledThisOpen = true
-                true
-            }
-        }
-        if (!take) return false
-        mainHandler.removeCallbacks(directGattWatchdogRunnable)
-        if (status != BluetoothGatt.GATT_SUCCESS) {
-            logger.w(
-                sessionIdForLogs(),
-                "connect_retry",
-                mapOf(
-                    "reason" to "disconnected_non_success_status",
-                    "mac" to target,
-                    "status" to status,
-                    "statusLabel" to gattStatusLabel(status),
-                    "msg" to "Disconnected before ready; will retry if attempts remain",
-                ),
-            )
-        }
-        scheduleDirectGattRetryOrExhaust()
+    /** @return true to suppress IDLE (scan-based auto-retry scheduled). */
+    private fun maybeScheduleScanConnectRecoveryOnDisconnect(gatt: BluetoothGatt, status: Int): Boolean {
+        if (!scanConnectSessionActive || !scanConnectAutoRetryEnabled) return false
+        logger.w(
+            sessionIdForLogs(),
+            "ble_scan_connect_disconnect_will_rescan",
+            mapOf(
+                "device" to gatt.device.address,
+                "status" to status,
+                "statusLabel" to gattStatusLabel(status),
+                "msg" to "Will restart full scan→connect flow after ${SCAN_CONNECT_DISCONNECT_RETRY_MS}ms (no direct MAC reconnect)",
+            ),
+        )
+        scheduleScanConnectFullRecovery(reason = "gatt_disconnected_${status}")
         return true
     }
 
-    private fun onDirectGattWatchdogTimeout() {
-        if (!directGattReliabilityActive) return
-        if (directGattSawConnectedThisOpen) return
-        val take = synchronized(directGattLock) {
-            if (directGattFailureHandledThisOpen) false
-            else {
-                directGattFailureHandledThisOpen = true
-                true
+    private fun maybeScheduleScanConnectRecoveryFromConnection(reason: String, disconnectFirst: Boolean = false) {
+        if (!scanConnectSessionActive || !scanConnectAutoRetryEnabled) return
+        if (disconnectFirst) {
+            try {
+                gatt?.disconnect()
+            } catch (_: Exception) {
             }
         }
-        if (!take) return
-        val mac = directGattReliabilityMac ?: ""
-        logger.w(
-            sessionIdForLogs(),
-            "connect_timeout",
-            mapOf(
-                "mac" to mac,
-                "openAttempt" to directGattOpenCount,
-                "timeoutMs" to DIRECT_GATT_STATE_WATCHDOG_MS,
-                "msg" to "No usable GATT connection within ${DIRECT_GATT_STATE_WATCHDOG_MS}ms",
-            ),
-        )
-        try {
-            gatt?.disconnect()
-            gatt?.close()
-        } catch (_: Exception) {
-        }
-        gatt = null
-        scheduleDirectGattRetryOrExhaust()
-    }
-
-    private fun scheduleDirectGattRetryOrExhaust() {
-        if (directGattOpenCount < MAX_DIRECT_GATT_CONNECT_OPENS) {
-            if (adapter == null || !adapter.isEnabled) {
-                logger.w(
-                    sessionIdForLogs(),
-                    "connect_retry_deferred_adapter_off",
-                    mapOf(
-                        "mac" to (directGattReliabilityMac ?: ""),
-                        "msg" to "Bluetooth adapter off; will open GATT after adapter turns ON (stabilize delay)",
-                    ),
-                )
-                awaitingAdapterOnForGattRetry = true
-                ensureBluetoothAdapterStateReceiverRegistered()
-                return
-            }
-            awaitingAdapterOnForGattRetry = false
-            logger.w(
-                sessionIdForLogs(),
-                "connect_retry",
-                mapOf(
-                    "nextOpenAttempt" to (directGattOpenCount + 1),
-                    "maxAttempts" to MAX_DIRECT_GATT_CONNECT_OPENS,
-                    "mac" to (directGattReliabilityMac ?: ""),
-                    "retryDelayMs" to DIRECT_CONNECT_RETRY_GAP_MS,
-                ),
-            )
-            cancelDirectGattWatchdogAndRetryRunnables()
-            val r = Runnable {
-                directGattRetryRunnable = null
-                if (directGattReliabilityMac == null) return@Runnable
-                openNextDirectGattReliabilityOpen()
-            }
-            directGattRetryRunnable = r
-            mainHandler.postDelayed(r, DIRECT_CONNECT_RETRY_GAP_MS)
-        } else {
-            cancelDirectGattReliabilitySession()
-            onBleError("GATT connect failed after $MAX_DIRECT_GATT_CONNECT_OPENS attempts (timeouts or errors)")
-            onPipeline(W1PipelineState.IDLE, "GATT connect exhausted")
-        }
-    }
-
-    private fun openNextDirectGattReliabilityOpen() {
-        if (!directGattReliabilityActive) return
-        val mac = directGattReliabilityMac ?: return
-        if (adapter == null || !adapter.isEnabled) {
-            logger.w(
-                sessionIdForLogs(),
-                "connect_deferred_adapter_off",
-                mapOf("mac" to mac, "msg" to "Deferring GATT open until Bluetooth adapter is ON"),
-            )
-            awaitingAdapterOnForGattRetry = true
-            ensureBluetoothAdapterStateReceiverRegistered()
-            return
-        }
-        if (directGattOpenCount >= MAX_DIRECT_GATT_CONNECT_OPENS) {
-            cancelDirectGattReliabilitySession()
-            onBleError("GATT connect failed after $MAX_DIRECT_GATT_CONNECT_OPENS attempts")
-            onPipeline(W1PipelineState.IDLE, "GATT connect exhausted")
-            return
-        }
-        directGattOpenCount++
-        directGattSawConnectedThisOpen = false
-        directGattFailureHandledThisOpen = false
-        logger.i(
-            sessionIdForLogs(),
-            "connect_started",
-            mapOf(
-                "mac" to mac,
-                "openAttempt" to directGattOpenCount,
-                "maxAttempts" to MAX_DIRECT_GATT_CONNECT_OPENS,
-                "msg" to "connect_started attempt ${directGattOpenCount}/$MAX_DIRECT_GATT_CONNECT_OPENS for $mac",
-            ),
-        )
-        mainHandler.removeCallbacks(directGattWatchdogRunnable)
-        openGattDiscoveryConnection(mac, logBleConnectAttempt = false, bondPairingConflictWarn = true)
-        mainHandler.postDelayed(directGattWatchdogRunnable, DIRECT_GATT_STATE_WATCHDOG_MS)
-    }
-
-    private fun scheduleDirectGattConnectAfterScanStopped(normalizedMac: String) {
-        cancelDirectGattReliabilitySession()
-        ensureBluetoothAdapterStateReceiverRegistered()
-        directGattReliabilityActive = true
-        directGattReliabilityMac = normalizedMac
-        directGattOpenCount = 0
-        val r = Runnable {
-            postScanToGattRunnable = null
-            if (!directGattReliabilityActive || directGattReliabilityMac != normalizedMac) return@Runnable
-            openNextDirectGattReliabilityOpen()
-        }
-        postScanToGattRunnable = r
-        mainHandler.postDelayed(r, POST_SCAN_TO_GATT_DELAY_MS)
+        scheduleScanConnectFullRecovery(reason = reason)
     }
 
     private fun logAllGattStructure(gatt: BluetoothGatt) {
@@ -814,7 +849,7 @@ class W1BleGattCoordinator(
     }
 
     private fun stopConnectProbe() {
-        cancelDirectGattReliabilitySession()
+        cancelScanConnectSession()
         mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
         cancelProbeAdvanceOnly()
         connectProbeActive = false
@@ -1028,37 +1063,38 @@ class W1BleGattCoordinator(
         )
         mainHandler.removeCallbacks(connectProbeTimeoutRunnable)
         mainHandler.postDelayed(connectProbeTimeoutRunnable, PROBE_CONNECT_TIMEOUT_MS)
-        openGattDiscoveryConnection(mac)
+        openGattDiscoveryConnection(mac, cleanupDelayMs = 0L)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun openGattDiscoveryConnection(
-        normalizedMac: String,
-        logBleConnectAttempt: Boolean = true,
-        bondPairingConflictWarn: Boolean = true,
-        forceSafeConnectPath: Boolean = false,
-    ) {
+    private fun prepareGattTeardownSync() {
         try {
             gatt?.disconnect()
+        } catch (_: Exception) {
+        }
+        try {
             gatt?.close()
         } catch (_: Exception) {
         }
         gatt = null
         pendingNotifyCharacteristics.clear()
-        val ad = adapter ?: return
-        val device = try {
-            ad.getRemoteDevice(normalizedMac)
-        } catch (e: IllegalArgumentException) {
-            logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to normalizedMac), e)
-            onBleError("invalid MAC: ${e.message}")
-            return
-        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun performGattConnect(
+        device: BluetoothDevice,
+        addressForLogs: String,
+        logBleConnectAttempt: Boolean,
+        bondPairingConflictWarn: Boolean,
+        forceSafeConnectPath: Boolean,
+        deviceSource: String,
+    ) {
         val bondState = device.bondState
         logger.i(
             sessionIdForLogs(),
             "ble_gatt_pre_connect",
             mapOf(
-                "mac" to normalizedMac,
+                "mac" to addressForLogs,
+                "deviceSource" to deviceSource,
                 "bondState" to bondState,
                 "bondStateName" to bondStateName(bondState),
                 "bondPairingConflictWarn" to bondPairingConflictWarn,
@@ -1072,7 +1108,7 @@ class W1BleGattCoordinator(
                     "ble_gatt_bonded_may_conflict",
                     mapOf(
                         "msg" to "Device is bonded, may conflict with BLE",
-                        "mac" to normalizedMac,
+                        "mac" to addressForLogs,
                         "bondState" to bondState,
                     ),
                 )
@@ -1082,7 +1118,7 @@ class W1BleGattCoordinator(
                     "ble_gatt_bonded_force_safe",
                     mapOf(
                         "msg" to "Device is bonded; force safe connect proceeding (TRANSPORT_LE, post-scan delay)",
-                        "mac" to normalizedMac,
+                        "mac" to addressForLogs,
                     ),
                 )
         }
@@ -1091,7 +1127,7 @@ class W1BleGattCoordinator(
             logger.i(
                 sessionIdForLogs(),
                 "ble_connect_attempt",
-                mapOf("address" to normalizedMac),
+                mapOf("address" to addressForLogs, "deviceSource" to deviceSource),
             )
         }
         val transportLabel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1103,11 +1139,17 @@ class W1BleGattCoordinator(
             sessionIdForLogs(),
             "ble_gatt_connect_begin",
             mapOf(
-                "mac" to normalizedMac,
+                "mac" to addressForLogs,
                 "autoConnect" to false,
                 "transport" to transportLabel,
                 "apiLevel" to Build.VERSION.SDK_INT,
+                "deviceSource" to deviceSource,
             ),
+        )
+        logger.i(
+            sessionIdForLogs(),
+            "ble_gatt_connection_state_sink",
+            mapOf("msg" to "BluetoothGattCallback registered with connectGatt (native equivalent of connectionState.listen)"),
         )
         gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -1115,6 +1157,74 @@ class W1BleGattCoordinator(
             @Suppress("DEPRECATION")
             device.connectGatt(appContext, false, gattCallback)
         }
+        if (scanConnectSessionActive && scanConnectAutoRetryEnabled) {
+            mainHandler.removeCallbacks(scanConnectGattWatchdogRunnable)
+            mainHandler.postDelayed(scanConnectGattWatchdogRunnable, SCAN_CONNECT_GATT_WATCHDOG_MS)
+        }
+    }
+
+    /**
+     * Anonymous probe only: MAC from prior scan accumulator (not the preferred W1 scan→connect path).
+     */
+    @SuppressLint("MissingPermission")
+    private fun openGattDiscoveryConnection(
+        normalizedMac: String,
+        logBleConnectAttempt: Boolean = true,
+        bondPairingConflictWarn: Boolean = true,
+        forceSafeConnectPath: Boolean = false,
+        cleanupDelayMs: Long = GATT_CLEANUP_BEFORE_CONNECT_MS,
+    ) {
+        val ad = adapter ?: return
+        val device = try {
+            ad.getRemoteDevice(normalizedMac)
+        } catch (e: IllegalArgumentException) {
+            logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to normalizedMac), e)
+            onBleError("invalid MAC: ${e.message}")
+            return
+        }
+        prepareGattTeardownSync()
+        val address = normalizedMac.uppercase(Locale.US)
+        if (cleanupDelayMs <= 0L) {
+            performGattConnect(
+                device,
+                address,
+                logBleConnectAttempt,
+                bondPairingConflictWarn,
+                forceSafeConnectPath,
+                deviceSource = "remote_mac_probe",
+            )
+            return
+        }
+        mainHandler.postDelayed(
+            {
+                performGattConnect(
+                    device,
+                    address,
+                    logBleConnectAttempt,
+                    bondPairingConflictWarn,
+                    forceSafeConnectPath,
+                    deviceSource = "remote_mac_probe",
+                )
+            },
+            cleanupDelayMs,
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openGattDiscoveryConnectionFromScanResult(
+        device: BluetoothDevice,
+        logBleConnectAttempt: Boolean = true,
+        bondPairingConflictWarn: Boolean = true,
+        forceSafeConnectPath: Boolean = false,
+    ) {
+        performGattConnect(
+            device,
+            device.address.uppercase(Locale.US),
+            logBleConnectAttempt,
+            bondPairingConflictWarn,
+            forceSafeConnectPath,
+            deviceSource = "scan_result",
+        )
     }
 
     private fun parseRecordingPayload(bytes: ByteArray) {
@@ -1146,123 +1256,45 @@ class W1BleGattCoordinator(
     }
 
     /**
-     * Connects by public MAC, then discovers and logs every service and characteristic.
-     * Uses [BluetoothDevice.connectGatt] with autoConnect `false` (active connection).
+     * LE scan (15 s) for advertisements matching [macAddress] or [localNameHint], then
+     * GATT teardown + 500 ms → [connectGatt] on the **scanned** [BluetoothDevice] (TRANSPORT_LE, autoConnect false).
+     *
+     * @param localNameHint `null` → use [DEFAULT_W1_BLE_LOCAL_NAME]; blank string → MAC-only match.
      */
     @SuppressLint("MissingPermission")
-    fun connectToDevice(macAddress: String) {
-        stopConnectProbe()
-        if (adapter == null || !adapter.isEnabled) {
-            onBleError("Bluetooth off or unavailable")
-            return
+    fun connectToDevice(macAddress: String, localNameHint: String? = null) {
+        val nameFilter = when {
+            localNameHint == null -> DEFAULT_W1_BLE_LOCAL_NAME
+            localNameHint.isBlank() -> null
+            else -> localNameHint.trim()
         }
-        if (!hasConnectPermission()) {
-            onBleError("Missing BLUETOOTH_CONNECT / legacy Bluetooth permission")
-            return
-        }
-        if (!hasScanPermission()) {
-            onBleError("Missing BLUETOOTH_SCAN / legacy scan permission")
-            return
-        }
-        if (!hasLocationPermissionForBle()) {
-            logger.w(
-                sessionIdForLogs(),
-                "ble_connect_location_permission",
-                mapOf("msg" to "No ACCESS_FINE/COARSE_LOCATION grant; BLE may be unreliable on some devices"),
-            )
-        }
-        if (!isSystemLocationEnabled()) {
-            logger.w(
-                sessionIdForLogs(),
-                "ble_connect_location_services_off",
-                mapOf("msg" to "System location is OFF; turn Location ON for reliable BLE on many OEMs"),
-            )
-        }
-        stopScan()
-        val normalized = macAddress.trim().uppercase(Locale.US)
-        try {
-            adapter.getRemoteDevice(normalized)
-        } catch (e: IllegalArgumentException) {
-            logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to macAddress), e)
-            onBleError("invalid MAC: ${e.message}")
-            return
-        }
-        logger.i(
-            sessionIdForLogs(),
-            "ble_connect_session_start",
-            mapOf(
-                "mac" to normalized,
-                "postScanDelayMs" to POST_SCAN_TO_GATT_DELAY_MS,
-                "msg" to "Scan stopped; scheduling GATT (reliability opens with TRANSPORT_LE, autoConnect=false)",
-            ),
+        beginW1ScanBasedConnect(
+            macAddress = macAddress,
+            localNameHint = nameFilter,
+            bondPairingConflictWarn = true,
+            forceSafeConnectPath = false,
         )
-        scheduleDirectGattConnectAfterScanStopped(normalized)
     }
 
-    /**
-     * Debug-oriented path: [stopScan], short delay, single [connectGatt] with [BluetoothDevice.TRANSPORT_LE].
-     * Does not treat system bonding as a blocking warning (still logged at info).
-     */
+    /** Same as [connectToDevice] but skips bonded-device conflict warning (debug). */
     @SuppressLint("MissingPermission")
-    fun forceBleSafeConnect(macAddress: String) {
-        stopConnectProbe()
-        if (adapter == null || !adapter.isEnabled) {
-            onBleError("Bluetooth off or unavailable")
-            return
+    fun forceBleSafeConnect(macAddress: String, localNameHint: String? = null) {
+        val nameFilter = when {
+            localNameHint == null -> DEFAULT_W1_BLE_LOCAL_NAME
+            localNameHint.isBlank() -> null
+            else -> localNameHint.trim()
         }
-        if (!hasConnectPermission()) {
-            onBleError("Missing BLUETOOTH_CONNECT / legacy Bluetooth permission")
-            return
-        }
-        if (!hasScanPermission()) {
-            onBleError("Missing BLUETOOTH_SCAN / legacy scan permission")
-            return
-        }
-        if (!hasLocationPermissionForBle()) {
-            logger.w(
-                sessionIdForLogs(),
-                "ble_connect_location_permission",
-                mapOf("msg" to "No ACCESS_FINE/COARSE_LOCATION grant; BLE may be unreliable on some devices"),
-            )
-        }
-        if (!isSystemLocationEnabled()) {
-            logger.w(
-                sessionIdForLogs(),
-                "ble_connect_location_services_off",
-                mapOf("msg" to "System location is OFF; turn Location ON for reliable BLE on many OEMs"),
-            )
-        }
-        stopScan()
-        val normalized = macAddress.trim().uppercase(Locale.US)
-        try {
-            adapter.getRemoteDevice(normalized)
-        } catch (e: IllegalArgumentException) {
-            logger.e(sessionIdForLogs(), "ble_connect_invalid_mac", mapOf("mac" to macAddress), e)
-            onBleError("invalid MAC: ${e.message}")
-            return
-        }
-        postScanToGattRunnable?.let { mainHandler.removeCallbacks(it) }
-        logger.i(
-            sessionIdForLogs(),
-            "ble_force_safe_connect_scheduled",
-            mapOf("mac" to normalized, "delayMs" to FORCE_BLE_SAFE_POST_SCAN_MS),
+        beginW1ScanBasedConnect(
+            macAddress = macAddress,
+            localNameHint = nameFilter,
+            bondPairingConflictWarn = false,
+            forceSafeConnectPath = true,
         )
-        val r = Runnable {
-            postScanToGattRunnable = null
-            openGattDiscoveryConnection(
-                normalizedMac = normalized,
-                logBleConnectAttempt = true,
-                bondPairingConflictWarn = false,
-                forceSafeConnectPath = true,
-            )
-        }
-        postScanToGattRunnable = r
-        mainHandler.postDelayed(r, FORCE_BLE_SAFE_POST_SCAN_MS)
     }
 
     @SuppressLint("MissingPermission")
     fun startScanIfPermitted() {
-        cancelDirectGattReliabilitySession()
+        cancelScanConnectSession()
         if (adapter == null || !adapter.isEnabled) {
             onBleError("Bluetooth off or unavailable")
             return
@@ -1299,6 +1331,7 @@ class W1BleGattCoordinator(
     @SuppressLint("MissingPermission")
     fun disconnect() {
         stopConnectProbe()
+        cancelScanConnectSession()
         discoveryMode = false
         pendingNotifyCharacteristics.clear()
         stopScan()

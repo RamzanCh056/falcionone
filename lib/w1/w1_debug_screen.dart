@@ -21,6 +21,7 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
   final TextEditingController _url = TextEditingController(text: 'http://10.0.2.2:8765');
   final TextEditingController _recordingId = TextEditingController(text: 'rec-mock-1');
   final TextEditingController _bleMac = TextEditingController(text: '74:43:8F:7E:D2:A4');
+  final TextEditingController _bleLocalName = TextEditingController(text: 'SSJ-ZXAN9A1');
 
   @override
   void initState() {
@@ -40,6 +41,7 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     _url.dispose();
     _recordingId.dispose();
     _bleMac.dispose();
+    _bleLocalName.dispose();
     super.dispose();
   }
 
@@ -122,6 +124,14 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
             controller: _bleMac,
             decoration: const InputDecoration(
               labelText: 'W1 BLE MAC (GATT)',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _bleLocalName,
+            decoration: const InputDecoration(
+              labelText: 'W1 BLE local name (empty = MAC-only scan match)',
               border: OutlineInputBorder(),
             ),
           ),
@@ -216,7 +226,10 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
                     return;
                   }
                   try {
-                    await W1Platform.connectW1Ble(macAddress: _bleMac.text.trim());
+                    await W1Platform.connectW1Ble(
+                      macAddress: _bleMac.text.trim(),
+                      localName: _bleLocalName.text.trim(),
+                    );
                     if (!context.mounted) return;
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(content: Text('BLE connect scheduled — see native logs')),
@@ -249,7 +262,10 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
                     return;
                   }
                   try {
-                    await W1Platform.forceBleSafeConnect(macAddress: _bleMac.text.trim());
+                    await W1Platform.forceBleSafeConnect(
+                      macAddress: _bleMac.text.trim(),
+                      localName: _bleLocalName.text.trim(),
+                    );
                     if (!context.mounted) return;
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(content: Text('Force BLE safe connect scheduled — see native logs')),

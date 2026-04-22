@@ -156,7 +156,8 @@ object W1FlutterBridge {
                         if (mac.isEmpty()) {
                             result.error("W1_ERROR", "macAddress is required", null)
                         } else {
-                            realW1Device.connectToDevice(mac)
+                            val localNameHint = call.argument<String>("localName")?.trim()
+                            realW1Device.connectToDevice(mac, localNameHint)
                             result.success(null)
                         }
                     }
@@ -166,7 +167,8 @@ object W1FlutterBridge {
                         if (mac.isEmpty()) {
                             result.error("W1_ERROR", "macAddress is required", null)
                         } else {
-                            realW1Device.forceBleSafeConnect(mac)
+                            val localNameHint = call.argument<String>("localName")?.trim()
+                            realW1Device.forceBleSafeConnect(mac, localNameHint)
                             result.success(null)
                         }
                     }

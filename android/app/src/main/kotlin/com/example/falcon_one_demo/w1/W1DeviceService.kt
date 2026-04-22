@@ -88,17 +88,17 @@ class RealW1DeviceService(
     }
 
     /**
-     * Direct GATT connect for exploration (no scan UUID filters).
+     * GATT connect: LE scan for MAC / local name, then connect on the scanned Bluetooth LE device object.
      * Safe if [start] was never called: installs engine hooks and a coordinator without starting a scan.
      */
-    fun connectToDevice(macAddress: String) {
+    fun connectToDevice(macAddress: String, localNameHint: String? = null) {
         installEngineHooks()
         if (coordinator == null) {
             val c = newCoordinator()
             coordinator = c
             switchableBle.delegate = W1BleGattTransportImpl(c)
         }
-        coordinator?.connectToDevice(macAddress.trim())
+        coordinator?.connectToDevice(macAddress.trim(), localNameHint)
             ?: logger.e(
                 engine.currentState().sessionId.ifEmpty { "ble" },
                 "ble_connect_skipped",
@@ -107,15 +107,15 @@ class RealW1DeviceService(
             )
     }
 
-    /** Stop scan → short delay → single GATT open with [BluetoothDevice.TRANSPORT_LE] (debug / conflict mitigation). */
-    fun forceBleSafeConnect(macAddress: String) {
+    /** Same scan→connect path as [connectToDevice] with relaxed bonded-device warning (debug). */
+    fun forceBleSafeConnect(macAddress: String, localNameHint: String? = null) {
         installEngineHooks()
         if (coordinator == null) {
             val c = newCoordinator()
             coordinator = c
             switchableBle.delegate = W1BleGattTransportImpl(c)
         }
-        coordinator?.forceBleSafeConnect(macAddress.trim())
+        coordinator?.forceBleSafeConnect(macAddress.trim(), localNameHint)
             ?: logger.e(
                 engine.currentState().sessionId.ifEmpty { "ble" },
                 "ble_force_safe_skipped",
