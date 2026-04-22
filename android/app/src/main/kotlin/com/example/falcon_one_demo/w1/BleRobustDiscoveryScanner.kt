@@ -324,12 +324,12 @@ class BleRobustDiscoveryScanner(
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            recordAndLog(result)
+            recordAndLog(result, delivery = "single")
         }
 
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
             for (r in results) {
-                onScanResult(ScanCallback.SCAN_RESULT_TYPE_BATCH, r)
+                recordAndLog(r, delivery = "batch")
             }
         }
 
@@ -339,7 +339,7 @@ class BleRobustDiscoveryScanner(
     }
 
     @SuppressLint("MissingPermission")
-    private fun recordAndLog(result: ScanResult) {
+    private fun recordAndLog(result: ScanResult, delivery: String = "single") {
         val device = result.device
         val addr = device.address.uppercase(Locale.US)
         val nameDirect = device.name?.trim()?.takeIf { it.isNotEmpty() }
@@ -362,7 +362,7 @@ class BleRobustDiscoveryScanner(
         Log.i(tag, humanLine)
         Log.d(
             tag,
-            "  … services=[$svcStr] | manufacturer=[$mfgShort] | callbackType=${result.callbackType}",
+            "  … services=[$svcStr] | manufacturer=[$mfgShort] | delivery=$delivery",
         )
 
         val structured = linkedMapOf(
