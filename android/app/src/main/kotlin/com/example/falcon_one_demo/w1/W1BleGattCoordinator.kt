@@ -481,12 +481,19 @@ class W1BleGattCoordinator(
         scanConnectDiagnosticScanActive = true
         scanConnectAwaitingAdvertisement = false
         stopScan()
-        scanner = adapter?.bluetoothLeScanner
-        if (scanner == null || adapter == null || !adapter.isEnabled) {
+        val ad = adapter
+        if (ad == null || !ad.isEnabled) {
             scanConnectDiagnosticScanActive = false
             scheduleScanConnectFullRecovery(reason = "diagnostic_scanner_unavailable")
             return
         }
+        val leScanner = ad.bluetoothLeScanner
+        if (leScanner == null) {
+            scanConnectDiagnosticScanActive = false
+            scheduleScanConnectFullRecovery(reason = "diagnostic_scanner_unavailable")
+            return
+        }
+        scanner = leScanner
         logger.i(
             sessionIdForLogs(),
             "ble_diagnostic_scan_start",
@@ -519,7 +526,7 @@ class W1BleGattCoordinator(
         }
         diagnosticScanTimeoutRunnable = done
         mainHandler.postDelayed(done, DIAGNOSTIC_SCAN_MS)
-        scanner.startScan(null, settings, scanCallback)
+        leScanner.startScan(null, settings, scanCallback)
     }
 
     private fun scheduleScanConnectFullRecovery(reason: String) {
