@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicReference
 object W1FlutterBridge {
     const val methodChannelName = "com.example.falcon_one_demo/w1"
     const val eventChannelName = "com.example.falcon_one_demo/w1_state"
+    const val bleScanEventChannelName = "com.example.falcon_one_demo/w1_ble_scan"
 
     fun attach(activity: FlutterActivity, engine: FlutterEngine) {
         val ctx = activity.applicationContext
@@ -44,6 +45,7 @@ object W1FlutterBridge {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val mainHandler = Handler(Looper.getMainLooper())
         val eventSinkRef = AtomicReference<EventChannel.EventSink?>(null)
+        val bleScanSinkRef = AtomicReference<EventChannel.EventSink?>(null)
 
         val transferEngine = W1TransferEngine(
             appScope = scope,
@@ -66,6 +68,11 @@ object W1FlutterBridge {
             logger = logger,
             uuids = W1DeviceUuids(),
             wifiBinder = wifiBinder,
+            onBleScanUi = { payload ->
+                mainHandler.post {
+                    bleScanSinkRef.get()?.success(payload)
+                }
+            },
         )
 
         EventChannel(engine.dartExecutor.binaryMessenger, eventChannelName).setStreamHandler(
@@ -77,6 +84,18 @@ object W1FlutterBridge {
 
                 override fun onCancel(arguments: Any?) {
                     eventSinkRef.set(null)
+                }
+            },
+        )
+
+        EventChannel(engine.dartExecutor.binaryMessenger, bleScanEventChannelName).setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    bleScanSinkRef.set(events)
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    bleScanSinkRef.set(null)
                 }
             },
         )

@@ -14,8 +14,20 @@ class W1Platform {
     'com.example.falcon_one_demo/w1_state',
   );
 
+  static const EventChannel _bleScanEvents = EventChannel(
+    'com.example.falcon_one_demo/w1_ble_scan',
+  );
+
   static Stream<Map<dynamic, dynamic>> stateStream() {
     return _events.receiveBroadcastStream().map((event) {
+      if (event is Map) return Map<dynamic, dynamic>.from(event);
+      return <dynamic, dynamic>{};
+    });
+  }
+
+  /// Native BLE scan→connect UI phases (`phase`, `detail`, optional `attempt` / `maxAttempts` / `userHint`).
+  static Stream<Map<dynamic, dynamic>> bleScanUiStream() {
+    return _bleScanEvents.receiveBroadcastStream().map((event) {
       if (event is Map) return Map<dynamic, dynamic>.from(event);
       return <dynamic, dynamic>{};
     });
@@ -67,7 +79,6 @@ class W1Platform {
   }
 
   /// Native GATT: LE scan (15 s) for [macAddress] or [localName], then teardown + 500 ms → connectGatt (TRANSPORT_LE).
-  /// Omit [localName] to use default `SSJ-ZXAN9A1`; pass empty string for MAC-only matching.
   /// [localName] defaults to `SSJ-ZXAN9A1`; pass empty string for MAC-only scan match.
   static Future<void> connectW1Ble({
     required String macAddress,

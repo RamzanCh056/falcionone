@@ -29,6 +29,7 @@ class RealW1DeviceService(
     private val logger: W1Logger,
     private val uuids: W1DeviceUuids,
     private val wifiBinder: W1WifiNetworkBinder,
+    private val onBleScanUi: (Map<String, Any?>) -> Unit = { _ -> },
 ) : W1DeviceService {
 
     private var coordinator: W1BleGattCoordinator? = null
@@ -75,6 +76,7 @@ class RealW1DeviceService(
                     IllegalStateException(msg),
                 )
             },
+            onBleScanUi = onBleScanUi,
         )
     }
 

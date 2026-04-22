@@ -16,7 +16,9 @@ class W1DebugScreen extends StatefulWidget {
 
 class _W1DebugScreenState extends State<W1DebugScreen> {
   StreamSubscription<Map<dynamic, dynamic>>? _sub;
+  StreamSubscription<Map<dynamic, dynamic>>? _bleScanSub;
   Map<dynamic, dynamic> _state = <dynamic, dynamic>{};
+  Map<String, dynamic> _bleScanUi = <String, dynamic>{};
   final List<String> _logs = <String>[];
   final TextEditingController _url = TextEditingController(text: 'http://10.0.2.2:8765');
   final TextEditingController _recordingId = TextEditingController(text: 'rec-mock-1');
@@ -32,12 +34,23 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     _sub = W1Platform.stateStream().listen((event) {
       setState(() => _state = event);
     });
+    _bleScanSub = W1Platform.bleScanUiStream().listen((event) {
+      if (!mounted) return;
+      setState(() {
+        final m = <String, dynamic>{};
+        for (final MapEntry<dynamic, dynamic> e in event.entries) {
+          m['${e.key}'] = e.value;
+        }
+        _bleScanUi = m;
+      });
+    });
   }
 
   @override
   void dispose() {
     W1ClassicBluetooth.instance.onLogLinesChanged = null;
     _sub?.cancel();
+    _bleScanSub?.cancel();
     _url.dispose();
     _recordingId.dispose();
     _bleMac.dispose();
@@ -90,6 +103,98 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
     return false;
   }
 
+  Future<void> _runW1BleConnect({required bool forceSafe}) async {
+    if (!Platform.isAndroid) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('BLE GATT is Android-only.')),
+      );
+      return;
+    }
+    final ok = await _ensureAndroidGattPermissions();
+    if (!mounted) return;
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Bluetooth + location needed for GATT. Allow in Settings if denied permanently.',
+          ),
+        ),
+      );
+      return;
+    }
+    try {
+      final mac = _bleMac.text.trim();
+      final local = _bleLocalName.text.trim();
+      if (forceSafe) {
+        await W1Platform.forceBleSafeConnect(macAddress: mac, localName: local);
+      } else {
+        await W1Platform.connectW1Ble(macAddress: mac, localName: local);
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('BLE scan→connect started — watch status below')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Widget _bleScanStatusCard(BuildContext context) {
+    final phase = _bleScanUi['phase']?.toString() ?? '';
+    const visiblePhases = <String>{
+      'preparing',
+      'scanning',
+      'diagnostic',
+      'connecting',
+      'connected',
+      'exhausted',
+    };
+    if (!visiblePhases.contains(phase)) return const SizedBox.shrink();
+    final detail = _bleScanUi['detail']?.toString() ?? '';
+    final hint = _bleScanUi['userHint']?.toString();
+    final attempt = _bleScanUi['attempt'];
+    final maxA = _bleScanUi['maxAttempts'];
+    final exhausted = phase == 'exhausted';
+    final Color bg = exhausted
+        ? Theme.of(context).colorScheme.errorContainer.withValues(alpha: 0.35)
+        : phase == 'connected'
+        ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.4)
+        : Theme.of(context).colorScheme.surfaceContainerHighest;
+
+    return Card(
+      color: bg,
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('BLE scan / connect', style: Theme.of(context).textTheme.titleSmall),
+            const SizedBox(height: 6),
+            if (detail.isNotEmpty) Text(detail),
+            if (hint != null && hint.isNotEmpty && hint != detail) ...[
+              const SizedBox(height: 4),
+              Text(hint),
+            ],
+            if (attempt != null && maxA != null) ...[
+              const SizedBox(height: 4),
+              Text('Attempt $attempt of $maxA', style: Theme.of(context).textTheme.bodySmall),
+            ],
+            if (exhausted) ...[
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: () => _runW1BleConnect(forceSafe: false),
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry scan → connect'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final phase = _state['phase']?.toString() ?? '—';
@@ -135,6 +240,7 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
               border: OutlineInputBorder(),
             ),
           ),
+          if (Platform.isAndroid) _bleScanStatusCard(context),
           const SizedBox(height: 12),
           TextField(
             controller: _url,
@@ -206,75 +312,11 @@ class _W1DebugScreenState extends State<W1DebugScreen> {
                 child: const Text('Reset UI'),
               ),
               OutlinedButton(
-                onPressed: () async {
-                  if (!Platform.isAndroid) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('BLE GATT is Android-only.')),
-                    );
-                    return;
-                  }
-                  final ok = await _ensureAndroidGattPermissions();
-                  if (!context.mounted) return;
-                  if (!ok) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          'Bluetooth + location needed for GATT. Allow in Settings if denied permanently.',
-                        ),
-                      ),
-                    );
-                    return;
-                  }
-                  try {
-                    await W1Platform.connectW1Ble(
-                      macAddress: _bleMac.text.trim(),
-                      localName: _bleLocalName.text.trim(),
-                    );
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('BLE connect scheduled — see native logs')),
-                    );
-                  } catch (e) {
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
-                  }
-                },
+                onPressed: () => _runW1BleConnect(forceSafe: false),
                 child: const Text('Connect W1 BLE (GATT)'),
               ),
               OutlinedButton(
-                onPressed: () async {
-                  if (!Platform.isAndroid) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('BLE GATT is Android-only.')),
-                    );
-                    return;
-                  }
-                  final ok = await _ensureAndroidGattPermissions();
-                  if (!context.mounted) return;
-                  if (!ok) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          'Bluetooth + location needed for GATT. Allow in Settings if denied permanently.',
-                        ),
-                      ),
-                    );
-                    return;
-                  }
-                  try {
-                    await W1Platform.forceBleSafeConnect(
-                      macAddress: _bleMac.text.trim(),
-                      localName: _bleLocalName.text.trim(),
-                    );
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Force BLE safe connect scheduled — see native logs')),
-                    );
-                  } catch (e) {
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
-                  }
-                },
+                onPressed: () => _runW1BleConnect(forceSafe: true),
                 child: const Text('Force BLE Safe Connect'),
               ),
               OutlinedButton(

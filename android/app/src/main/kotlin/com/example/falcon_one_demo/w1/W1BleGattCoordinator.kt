@@ -44,6 +44,8 @@ class W1BleGattCoordinator(
     private val onPipeline: (W1PipelineState, String) -> Unit,
     private val onRecordingCompleteJson: (recordingId: String, extras: Map<String, String?>) -> Unit,
     private val onBleError: (message: String) -> Unit,
+    /** Flutter / UI: scan phase updates (String keys, JSON-serializable values). */
+    private val onBleScanUi: (Map<String, Any?>) -> Unit = { _ -> },
 ) {
     private companion object {
         /** Same meaning as [ScanRecord] TX power sentinel when AD 0x0A is absent (AOSP value 127). */
@@ -73,6 +75,15 @@ class W1BleGattCoordinator(
 
         /** If no CONNECTED within this window after [connectGatt], close and restart scan flow. */
         private const val SCAN_CONNECT_GATT_WATCHDOG_MS = 32_000L
+
+        /** After this many filtered scan windows with no target match, run one diagnostic scan (see [enterDiagnosticUnfilteredScanPhase]). */
+        private const val FILTERED_SCAN_TIMEOUTS_BEFORE_DIAGNOSTIC = 2
+
+        /** One-shot unfiltered discovery window to log every peripheral (names + MAC + RSSI). */
+        private const val DIAGNOSTIC_SCAN_MS = 10_000L
+
+        /** Ignore connect if matched advertisement is at or below this RSSI (ghost / edge of range). */
+        private const val MIN_RSSI_TO_CONNECT_DB = -90
     }
 
     private data class ScanAgg(var bestRssi: Int, var displayNameAtBest: String)
@@ -102,10 +113,22 @@ class W1BleGattCoordinator(
     private var scanConnectAttemptNumber: Int = 0
     private var scanForConnectTimeoutRunnable: Runnable? = null
     private var scanConnectDisconnectRetryRunnable: Runnable? = null
+    private var diagnosticScanTimeoutRunnable: Runnable? = null
     private val scanConnectGattWatchdogRunnable = Runnable { onScanConnectGattWatchdogTimeout() }
+
+    private var scanConnectFilteredTimeoutsWithoutMatch: Int = 0
+    private var scanConnectDiagnosticDone: Boolean = false
+    private var scanConnectDiagnosticScanActive: Boolean = false
 
     private val appContext = context.applicationContext
     private val adapter = (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+
+    private fun emitBleScanUi(fields: Map<String, Any?>) {
+        try {
+            onBleScanUi(fields)
+        } catch (_: Exception) {
+        }
+    }
     private var scanner = adapter?.bluetoothLeScanner
     private var gatt: BluetoothGatt? = null
 
@@ -156,6 +179,19 @@ class W1BleGattCoordinator(
         }
         logger.i(sessionIdForLogs(), "ble_device_seen", fields)
         recordScanSample(device.address, result.rssi, name)
+        if (scanConnectDiagnosticScanActive) {
+            logger.i(
+                sessionIdForLogs(),
+                "ble_diagnostic_device",
+                mapOf(
+                    "msg" to "FOUND: ${device.address} | name: $name | rssi: ${result.rssi}",
+                    "address" to device.address,
+                    "name" to name,
+                    "rssi" to result.rssi,
+                ),
+            )
+            return
+        }
         maybeOfferScanConnectCandidate(result)
     }
 
@@ -186,21 +222,44 @@ class W1BleGattCoordinator(
         val device = result.device ?: return
         val record = result.scanRecord
         if (!deviceMatchesScanConnectTarget(device, record)) return
-        mainHandler.post { commitScanConnectTargetFound(device) }
+        if (result.rssi <= MIN_RSSI_TO_CONNECT_DB) {
+            logger.i(
+                sessionIdForLogs(),
+                "ble_scan_connect_target_weak_rssi",
+                mapOf(
+                    "address" to device.address,
+                    "rssi" to result.rssi,
+                    "minRssiDb" to MIN_RSSI_TO_CONNECT_DB,
+                    "msg" to "Found target but RSSI too weak (${result.rssi} dBm ≤ $MIN_RSSI_TO_CONNECT_DB) — skipping connect, keep scanning",
+                ),
+            )
+            return
+        }
+        mainHandler.post { commitScanConnectTargetFound(device, result.rssi) }
     }
 
     @SuppressLint("MissingPermission")
-    private fun commitScanConnectTargetFound(device: BluetoothDevice) {
+    private fun commitScanConnectTargetFound(device: BluetoothDevice, rssi: Int) {
         if (!scanConnectSessionActive || !scanConnectAwaitingAdvertisement) return
         scanConnectAwaitingAdvertisement = false
         scanForConnectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         scanForConnectTimeoutRunnable = null
         stopScan()
+        emitBleScanUi(
+            mapOf(
+                "phase" to "connecting",
+                "attempt" to scanConnectAttemptNumber,
+                "maxAttempts" to MAX_SCAN_CONNECT_CYCLES,
+                "detail" to "Device found! Connecting…",
+                "rssi" to rssi,
+            ),
+        )
         logger.i(
             sessionIdForLogs(),
             "ble_scan_connect_target_found",
             mapOf(
                 "address" to device.address,
+                "rssi" to rssi,
                 "bondState" to device.bondState,
                 "bondStateName" to bondStateName(device.bondState),
                 "msg" to "Matched scan result; stopping scan before GATT (scanned device object, not remote MAC only)",
@@ -239,6 +298,8 @@ class W1BleGattCoordinator(
         scanForConnectTimeoutRunnable = null
         scanConnectDisconnectRetryRunnable?.let { mainHandler.removeCallbacks(it) }
         scanConnectDisconnectRetryRunnable = null
+        diagnosticScanTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        diagnosticScanTimeoutRunnable = null
         mainHandler.removeCallbacks(scanConnectGattWatchdogRunnable)
     }
 
@@ -247,9 +308,12 @@ class W1BleGattCoordinator(
         scanConnectSessionActive = false
         scanConnectAwaitingAdvertisement = false
         scanConnectAutoRetryEnabled = false
+        scanConnectDiagnosticScanActive = false
         scanConnectTargetMac = null
         scanConnectTargetLocalName = null
         scanConnectAttemptNumber = 0
+        scanConnectFilteredTimeoutsWithoutMatch = 0
+        scanConnectDiagnosticDone = false
     }
 
     @SuppressLint("MissingPermission")
@@ -262,6 +326,18 @@ class W1BleGattCoordinator(
         }
         scanConnectAttemptNumber++
         if (scanConnectAttemptNumber > MAX_SCAN_CONNECT_CYCLES) {
+            val hint =
+                "W1 device not found after $MAX_SCAN_CONNECT_CYCLES scan attempts. " +
+                    "Please ensure the device is powered on and not connected to another phone, then tap Retry."
+            emitBleScanUi(
+                mapOf(
+                    "phase" to "exhausted",
+                    "attempt" to MAX_SCAN_CONNECT_CYCLES,
+                    "maxAttempts" to MAX_SCAN_CONNECT_CYCLES,
+                    "detail" to "Device not found — is W1 powered on and advertising?",
+                    "userHint" to hint,
+                ),
+            )
             onBleError("BLE scan/connect exhausted after $MAX_SCAN_CONNECT_CYCLES attempts")
             cancelScanConnectSession()
             return
@@ -274,6 +350,14 @@ class W1BleGattCoordinator(
             cancelScanConnectSession()
             return
         }
+        emitBleScanUi(
+            mapOf(
+                "phase" to "scanning",
+                "attempt" to scanConnectAttemptNumber,
+                "maxAttempts" to MAX_SCAN_CONNECT_CYCLES,
+                "detail" to "Scanning… (attempt ${scanConnectAttemptNumber} of $MAX_SCAN_CONNECT_CYCLES)",
+            ),
+        )
         val timeout = Runnable {
             scanForConnectTimeoutRunnable = null
             if (!scanConnectSessionActive || !scanConnectAwaitingAdvertisement) return@Runnable
@@ -289,6 +373,16 @@ class W1BleGattCoordinator(
                     "msg" to "No advertisement from target within scan window — device must be advertising",
                 ),
             )
+            scanConnectFilteredTimeoutsWithoutMatch++
+            if (scanConnectFilteredTimeoutsWithoutMatch >= FILTERED_SCAN_TIMEOUTS_BEFORE_DIAGNOSTIC &&
+                !scanConnectDiagnosticDone &&
+                scanConnectSessionActive &&
+                scanConnectAutoRetryEnabled
+            ) {
+                scanConnectDiagnosticDone = true
+                enterDiagnosticUnfilteredScanPhase()
+                return@Runnable
+            }
             scheduleScanConnectFullRecovery(reason = "scan_timeout")
         }
         scanForConnectTimeoutRunnable = timeout
@@ -359,6 +453,9 @@ class W1BleGattCoordinator(
         scanConnectForceSafePath = forceSafeConnectPath
         scanConnectAutoRetryEnabled = true
         scanConnectAttemptNumber = 0
+        scanConnectFilteredTimeoutsWithoutMatch = 0
+        scanConnectDiagnosticDone = false
+        scanConnectDiagnosticScanActive = false
         logger.i(
             sessionIdForLogs(),
             "ble_scan_connect_flow_start",
@@ -368,7 +465,61 @@ class W1BleGattCoordinator(
                 "msg" to "GATT cleanup then LE scan → connect using scanned BluetoothDevice",
             ),
         )
+        emitBleScanUi(mapOf("phase" to "preparing", "detail" to "Preparing (GATT cleanup)…"))
         gattCleanupBeforeConnectRunnable(Runnable { enterScanPhaseForConnect() })
+    }
+
+    /**
+     * Same hardware unfiltered LE scan as normal discovery, but for [DIAGNOSTIC_SCAN_MS] we only log
+     * every peripheral ([ble_diagnostic_device]) and do not match the W1 target — helps when filtered
+     * match never fires on some stacks.
+     */
+    @SuppressLint("MissingPermission")
+    private fun enterDiagnosticUnfilteredScanPhase() {
+        if (!scanConnectSessionActive || !scanConnectAutoRetryEnabled) return
+        cancelScanConnectDelayedRunnables()
+        scanConnectDiagnosticScanActive = true
+        scanConnectAwaitingAdvertisement = false
+        stopScan()
+        scanner = adapter?.bluetoothLeScanner
+        if (scanner == null || adapter == null || !adapter.isEnabled) {
+            scanConnectDiagnosticScanActive = false
+            scheduleScanConnectFullRecovery(reason = "diagnostic_scanner_unavailable")
+            return
+        }
+        logger.i(
+            sessionIdForLogs(),
+            "ble_diagnostic_scan_start",
+            mapOf(
+                "durationMs" to DIAGNOSTIC_SCAN_MS,
+                "msg" to "Unfiltered discovery scan — logging FOUND: MAC | name | rssi for all advertisements",
+            ),
+        )
+        emitBleScanUi(
+            mapOf(
+                "phase" to "diagnostic",
+                "attempt" to scanConnectAttemptNumber,
+                "maxAttempts" to MAX_SCAN_CONNECT_CYCLES,
+                "detail" to "Diagnostic scan (no target filter) — logging all nearby devices for 10s",
+            ),
+        )
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        val done = Runnable {
+            diagnosticScanTimeoutRunnable = null
+            scanConnectDiagnosticScanActive = false
+            stopScan()
+            logger.i(
+                sessionIdForLogs(),
+                "ble_diagnostic_scan_complete",
+                mapOf("msg" to "Diagnostic scan finished; resuming filtered W1 scan flow after delay"),
+            )
+            scheduleScanConnectFullRecovery(reason = "post_diagnostic")
+        }
+        diagnosticScanTimeoutRunnable = done
+        mainHandler.postDelayed(done, DIAGNOSTIC_SCAN_MS)
+        scanner.startScan(null, settings, scanCallback)
     }
 
     private fun scheduleScanConnectFullRecovery(reason: String) {
@@ -417,6 +568,13 @@ class W1BleGattCoordinator(
         scanConnectAwaitingAdvertisement = false
         scanConnectTargetMac = null
         scanConnectTargetLocalName = null
+        emitBleScanUi(
+            mapOf(
+                "phase" to "connected",
+                "detail" to "Connected — GATT services discovered",
+                "userHint" to "Connected ✅",
+            ),
+        )
         logger.i(
             sessionIdForLogs(),
             "ble_scan_connect_ready",
@@ -1295,6 +1453,7 @@ class W1BleGattCoordinator(
     @SuppressLint("MissingPermission")
     fun startScanIfPermitted() {
         cancelScanConnectSession()
+        emitBleScanUi(mapOf("phase" to "idle", "detail" to "Background discovery scan (connect session cancelled)"))
         if (adapter == null || !adapter.isEnabled) {
             onBleError("Bluetooth off or unavailable")
             return
@@ -1332,6 +1491,7 @@ class W1BleGattCoordinator(
     fun disconnect() {
         stopConnectProbe()
         cancelScanConnectSession()
+        emitBleScanUi(mapOf("phase" to "idle", "detail" to "Disconnected"))
         discoveryMode = false
         pendingNotifyCharacteristics.clear()
         stopScan()
