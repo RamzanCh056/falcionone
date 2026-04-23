@@ -28,6 +28,37 @@ subprojects {
         } catch (_: Exception) {
         }
     }
+
+    // Legacy plugins (e.g. flutter_bluetooth_serial) ship compileSdk 30; merged androidx resources
+    // reference android:attr/lStar (API 31+). Bump so :verifyReleaseResources succeeds.
+    afterEvaluate {
+        val androidExt = extensions.findByName("android") ?: return@afterEvaluate
+        var bumped = false
+        for (methodName in listOf("setCompileSdkVersion", "setCompileSdk")) {
+            val m =
+                androidExt.javaClass.methods.find {
+                    it.name == methodName && it.parameterTypes.size == 1
+                }
+                    ?: continue
+            val p = m.parameterTypes[0]
+            if (p != Int::class.javaPrimitiveType && p != Integer::class.java) continue
+            try {
+                m.invoke(androidExt, 35)
+                bumped = true
+                break
+            } catch (_: Exception) {
+            }
+        }
+        if (!bumped) {
+            try {
+                val getter = androidExt.javaClass.methods.find { it.name == "getCompileSdk" && it.parameterTypes.isEmpty() }
+                val prop = getter?.invoke(androidExt) ?: return@afterEvaluate
+                val set = prop.javaClass.methods.find { it.name == "set" && it.parameterTypes.size == 1 }
+                set?.invoke(prop, 35)
+            } catch (_: Exception) {
+            }
+        }
+    }
 }
 subprojects {
     project.evaluationDependsOn(":app")

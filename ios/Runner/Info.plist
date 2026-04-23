@@ -47,6 +47,13 @@
 	<string>This app requires the camera.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app requires the microphone for communication.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect to the W1 bodycam over your local Wi‑Fi to download recordings.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>

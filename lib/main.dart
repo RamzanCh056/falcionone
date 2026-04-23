@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:falcon_one_demo/app.dart';
 import 'package:falcon_one_demo/data/call_service.dart';
 import 'package:falcon_one_demo/mapbox_config.dart';
+import 'package:falcon_one_demo/services/w1_service.dart';
 import 'package:falcon_one_demo/utils/call_foreground_task.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -74,6 +75,8 @@ Future<void> initializeServices() async {
   } else {
     MapboxOptions.setAccessToken(token);
   }
+
+  Get.put(W1Service(), permanent: true);
 
   await Permission.locationWhenInUse.request();
 }

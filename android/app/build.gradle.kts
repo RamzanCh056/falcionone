@@ -7,7 +7,8 @@ plugins {
 
 android {
     namespace = "com.example.falcon_one_demo"
-    compileSdk = flutter.compileSdkVersion
+    // At least 31 for android:attr/lStar (androidx); keep >= Flutter default.
+    compileSdk = flutter.compileSdkVersion.coerceAtLeast(35)
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
