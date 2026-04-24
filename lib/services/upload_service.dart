@@ -7,7 +7,7 @@ import 'package:http/http.dart' as http;
 /// Multipart upload to Nexus incidents API.
 class UploadService {
   UploadService({
-    this.baseUrl = 'https://nexus.aeriaone.com/api/incidents/upload/',
+    this.baseUrl = 'https://nexus.aeriaone.com/api/incidents/upload/?bypass_processing=true',
     this.officerCode = 'off-001',
   });
 
@@ -23,7 +23,13 @@ class UploadService {
       );
     }
 
-    final uri = Uri.parse(baseUrl);
+    final parsed = Uri.parse(baseUrl);
+    final uri = parsed.replace(
+      queryParameters: <String, String>{
+        ...parsed.queryParameters,
+        'bypass_processing': 'true',
+      },
+    );
     final request = http.MultipartRequest('POST', uri);
     request.fields['officer_code'] = officerCode;
     request.fields['raw_metadata'] = jsonEncode(metadata);
