@@ -7,6 +7,7 @@ import 'package:falcon_one_demo/data/call_service.dart';
 import 'package:falcon_one_demo/models/w1_recording.dart';
 import 'package:falcon_one_demo/services/upload_service.dart';
 import 'package:falcon_one_demo/services/w1_service.dart';
+import 'package:falcon_one_demo/w1/w1_classic_bluetooth.dart';
 import 'package:falcon_one_demo/widgets/w1_recording_import_sheet.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -75,14 +76,20 @@ class MapController extends GetxController {
   /// W1 `/status` LIVE recording flag (HTTP polling).
   final RxBool isW1Recording = false.obs;
   final RxBool isCheckingStatus = false.obs;
-  final RxString w1StatusMessage = 'No active recording'.obs;
+  final RxString w1StatusMessage = 'Connecting to W1...'.obs;
 
   bool _w1LastRecordingPoll = false;
   bool _w1EverSawRecordingTrue = false;
   bool _w1RecordingStopSnackShown = false;
   Timer? _w1StatusPollTimer;
+  VoidCallback? _w1ClassicStatusListener;
+  VoidCallback? _w1ClassicConnectionListener;
+  VoidCallback? _w1ClassicChannelListener;
+  int _w1StatusWaitTicks = 0;
+  bool _w1StatusTimeoutNotified = false;
+  String _lastW1UserError = '';
 
-  /// Manual W1 HTTP endpoint, e.g. `setW1BaseUrl('192.168.1.42', 8080)`.
+  /// Compatibility entrypoint; production path auto-discovers URL from Bluetooth STATUS.
   void setW1BaseUrl(String ip, int port) => w1Service.setBaseUrl(ip, port);
 
   /// Nullable GPS for API / UI (null until fix acquired).
@@ -155,7 +162,7 @@ class MapController extends GetxController {
             );
           }
         } else if (!_w1EverSawRecordingTrue) {
-          w1StatusMessage.value = 'No active recording';
+          w1StatusMessage.value = 'W1 Connected';
         } else {
           w1StatusMessage.value = '✅ Recording complete — tap ⏱ to load video';
         }
@@ -180,6 +187,88 @@ class MapController extends GetxController {
     return false;
   }
 
+  void _onClassicStatusUpdated() {
+    final status = W1ClassicBluetooth.instance.latestStatus.value;
+    if (status == null) {
+      if (W1ClassicBluetooth.instance.isW1Bonded.value) {
+        w1StatusMessage.value = 'W1 connected but device did not return file server info';
+      }
+      return;
+    }
+    _w1StatusWaitTicks = 0;
+    _w1StatusTimeoutNotified = false;
+    final ip = status['file_server_ip']?.toString().trim() ?? '';
+    final rawPort = status['file_server_port'];
+    final int? port = switch (rawPort) {
+      int v => v,
+      String v => int.tryParse(v.trim()),
+      _ => null,
+    };
+    if (ip.isEmpty || port == null) {
+      const msg = 'Unable to get W1 file server details';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+      return;
+    }
+    w1Service.setBaseUrl(ip, port);
+    debugPrint('[W1] Base URL configured http://$ip:$port');
+    if (!isW1Recording.value) {
+      w1StatusMessage.value = 'W1 Connected';
+    }
+    unawaited(fetchW1Status());
+  }
+
+  void _onClassicConnectionUpdated() {
+    final w1 = W1ClassicBluetooth.instance;
+    if (w1.isW1Bonded.value && !w1.isConnectionOpen.value && (w1BaseUrl == null || w1BaseUrl!.isEmpty)) {
+      w1StatusMessage.value = 'W1 paired';
+    }
+  }
+
+  void _onClassicChannelStatusUpdated() {
+    final s = W1ClassicBluetooth.instance.status.value?.trim() ?? '';
+    if (s.isEmpty) return;
+    if (s.startsWith('Connect failed') ||
+        s.startsWith('Input stream closed') ||
+        s.startsWith('Classic Bluetooth is only supported')) {
+      const msg = 'Unable to communicate with W1';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+    }
+  }
+
+  void _notifyW1Error(String message) {
+    if (_lastW1UserError == message) return;
+    _lastW1UserError = message;
+    _safeSnackBar('W1', message, backgroundColor: Colors.red.shade900, colorText: Colors.white);
+  }
+
+  Future<void> _ensureClassicStatusChannel() async {
+    try {
+      await W1ClassicBluetooth.instance.ensureStatusChannel();
+    } catch (e, st) {
+      debugPrint('_ensureClassicStatusChannel: $e\n$st');
+      const msg = 'Unable to communicate with W1';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+      return;
+    }
+
+    final w1 = W1ClassicBluetooth.instance;
+    if (w1.isConnectionOpen.value && w1.latestStatus.value == null) {
+      _w1StatusWaitTicks += 1;
+      if (_w1StatusWaitTicks >= 2 && !_w1StatusTimeoutNotified) {
+        _w1StatusTimeoutNotified = true;
+        const msg = 'W1 connected but device did not return file server info';
+        w1StatusMessage.value = msg;
+        _notifyW1Error(msg);
+      }
+    } else {
+      _w1StatusWaitTicks = 0;
+      _w1StatusTimeoutNotified = false;
+    }
+  }
+
   /// W1: clock opens sheet, then [fetchLatestRecording] runs `GET /recordings/latest` → download → [selectedVideo].
   void onTimerClick() {
     if (isW1Recording.value) return;
@@ -198,7 +287,8 @@ class MapController extends GetxController {
   Future<void> fetchRecordings() async {
     w1ImportError.value = '';
     if (w1BaseUrl == null || w1BaseUrl!.isEmpty) {
-      throw StateError('W1 base URL is not set; call setW1BaseUrl(ip, port) first.');
+      w1ImportError.value = 'Connecting to W1...';
+      return;
     }
     isFetchingRecordings.value = true;
     try {
@@ -217,9 +307,8 @@ class MapController extends GetxController {
     videoSelectedAt.value = null;
 
     if (w1BaseUrl == null || w1BaseUrl!.isEmpty) {
-      const msg = 'W1 URL not set. Call setW1BaseUrl("192.168.x.x", 8080) first (phone on same Wi‑Fi as the camera).';
+      const msg = 'Connecting to W1...';
       w1ImportError.value = msg;
-      _safeSnackBar('W1', msg, backgroundColor: Colors.red.shade900, colorText: Colors.white);
       return;
     }
 
@@ -229,7 +318,7 @@ class MapController extends GetxController {
       latest = await w1Service.getLatestRecording();
     } catch (e, st) {
       debugPrint('fetchLatestRecording GET: $e\n$st');
-      final msg = 'Failed to get latest recording: $e';
+      const msg = 'Unable to fetch latest recording';
       w1ImportError.value = msg;
       _safeSnackBar('W1', msg, backgroundColor: Colors.red.shade900, colorText: Colors.white);
       return;
@@ -251,9 +340,10 @@ class MapController extends GetxController {
       selectedVideo.value = file;
       videoSelectedAt.value = DateTime.now();
       _resetUploadUiState();
+      await uploadVideo();
     } catch (e, st) {
       debugPrint('fetchLatestRecording download: $e\n$st');
-      final msg = 'Download failed: $e';
+      const msg = 'Recording download failed';
       w1ImportError.value = msg;
       w1ActiveRecording.value = null;
       _safeSnackBar('W1', msg, backgroundColor: Colors.red.shade900, colorText: Colors.white);
@@ -456,14 +546,16 @@ class MapController extends GetxController {
           debugPrint('UPLOAD SUCCESS id=$id status=${lastUploadedApiStatus.value}');
         }
       } else {
-        uploadErrorDetail.value = res.errorMessage ?? 'Upload failed';
+        uploadErrorDetail.value = res.errorMessage ?? 'Video upload failed';
         uploadUiPhase.value = IncidentUploadUiPhase.error;
+        _safeSnackBar('Upload', 'Video upload failed', backgroundColor: Colors.red.shade800, colorText: Colors.white);
         debugPrint('UPLOAD FAILED http=${res.httpStatus} ${res.errorMessage}');
       }
     } catch (e, st) {
       debugPrint('UPLOAD ERROR: $e\n$st');
       uploadErrorDetail.value = e.toString();
       uploadUiPhase.value = IncidentUploadUiPhase.error;
+      _safeSnackBar('Upload', 'Video upload failed', backgroundColor: Colors.red.shade800, colorText: Colors.white);
     } finally {
       isUploading.value = false;
       update();
@@ -586,8 +678,20 @@ class MapController extends GetxController {
 
     _w1StatusPollTimer?.cancel();
     _w1StatusPollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      unawaited(_ensureClassicStatusChannel());
       unawaited(fetchW1Status());
     });
+    _w1ClassicStatusListener = _onClassicStatusUpdated;
+    _w1ClassicConnectionListener = _onClassicConnectionUpdated;
+    _w1ClassicChannelListener = _onClassicChannelStatusUpdated;
+    W1ClassicBluetooth.instance.latestStatus.addListener(_w1ClassicStatusListener!);
+    W1ClassicBluetooth.instance.isW1Bonded.addListener(_w1ClassicConnectionListener!);
+    W1ClassicBluetooth.instance.isConnectionOpen.addListener(_w1ClassicConnectionListener!);
+    W1ClassicBluetooth.instance.status.addListener(_w1ClassicChannelListener!);
+    unawaited(_ensureClassicStatusChannel());
+    _onClassicStatusUpdated();
+    _onClassicConnectionUpdated();
+    _onClassicChannelStatusUpdated();
     unawaited(fetchW1Status());
   }
 
@@ -595,6 +699,19 @@ class MapController extends GetxController {
   void onClose() {
     _w1StatusPollTimer?.cancel();
     _w1StatusPollTimer = null;
+    if (_w1ClassicStatusListener != null) {
+      W1ClassicBluetooth.instance.latestStatus.removeListener(_w1ClassicStatusListener!);
+      _w1ClassicStatusListener = null;
+    }
+    if (_w1ClassicConnectionListener != null) {
+      W1ClassicBluetooth.instance.isW1Bonded.removeListener(_w1ClassicConnectionListener!);
+      W1ClassicBluetooth.instance.isConnectionOpen.removeListener(_w1ClassicConnectionListener!);
+      _w1ClassicConnectionListener = null;
+    }
+    if (_w1ClassicChannelListener != null) {
+      W1ClassicBluetooth.instance.status.removeListener(_w1ClassicChannelListener!);
+      _w1ClassicChannelListener = null;
+    }
     _remoteLocationsWorker?.dispose();
     _localLocationWorker?.dispose();
     _satelliteCountWorker?.dispose();

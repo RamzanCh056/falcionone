@@ -27,7 +27,7 @@ class W1Service extends GetxService {
   Uri _requireBaseUri() {
     final raw = baseUrl.value?.trim();
     if (raw == null || raw.isEmpty) {
-      throw StateError('W1 base URL is not set; call setBaseUrl(ip, port) first.');
+      throw StateError('W1 is not connected yet; waiting for Bluetooth STATUS.');
     }
     return Uri.parse(raw);
   }
