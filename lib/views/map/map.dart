@@ -176,7 +176,7 @@ class MapView extends GetView<MapController> {
             if (noUrl) {
               bg = Colors.blueGrey.withValues(alpha: 0.25);
               fg = Colors.blueGrey.shade100;
-              primary = 'Connecting to W1...';
+              primary = msg.isEmpty ? 'Connecting to W1...' : msg;
             } else if (unreachable) {
               bg = Colors.orange.withValues(alpha: 0.2);
               fg = Colors.orange.shade200;

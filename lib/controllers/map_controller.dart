@@ -89,6 +89,8 @@ class MapController extends GetxController {
   int _w1StatusWaitTicks = 0;
   bool _w1StatusTimeoutNotified = false;
   String _lastW1UserError = '';
+  Timer? _w1StatusResponseTimeout;
+  DateTime? _w1ConnectAttemptStartedAt;
 
   /// Compatibility entrypoint; production path auto-discovers URL from Bluetooth STATUS.
   void setW1BaseUrl(String ip, int port) => w1Service.setBaseUrl(ip, port);
@@ -192,12 +194,15 @@ class MapController extends GetxController {
     final status = W1ClassicBluetooth.instance.latestStatus.value;
     if (status == null) {
       if (W1ClassicBluetooth.instance.isW1Bonded.value) {
-        w1StatusMessage.value = 'W1 connected but device did not return file server info';
+        w1StatusMessage.value = 'W1 file server unavailable';
       }
       return;
     }
     _w1StatusWaitTicks = 0;
     _w1StatusTimeoutNotified = false;
+    _w1StatusResponseTimeout?.cancel();
+    _w1StatusResponseTimeout = null;
+    _w1ConnectAttemptStartedAt = null;
     final ip = status['file_server_ip']?.toString().trim() ?? '';
     final rawPort = status['file_server_port'];
     final int? port = switch (rawPort) {
@@ -206,7 +211,7 @@ class MapController extends GetxController {
       _ => null,
     };
     if (ip.isEmpty || port == null) {
-      const msg = 'Unable to get W1 file server details';
+      const msg = 'W1 file server unavailable';
       w1StatusMessage.value = msg;
       _notifyW1Error(msg);
       return;
@@ -222,17 +227,36 @@ class MapController extends GetxController {
   void _onClassicConnectionUpdated() {
     final w1 = W1ClassicBluetooth.instance;
     if (w1.isW1Bonded.value && !w1.isConnectionOpen.value && (w1BaseUrl == null || w1BaseUrl!.isEmpty)) {
-      w1StatusMessage.value = 'W1 paired';
+      final current = w1StatusMessage.value;
+      if (current == 'Connecting to W1...' || current == 'W1 paired') {
+        w1StatusMessage.value = 'W1 paired';
+      }
     }
   }
 
   void _onClassicChannelStatusUpdated() {
     final s = W1ClassicBluetooth.instance.status.value?.trim() ?? '';
     if (s.isEmpty) return;
-    if (s.startsWith('Connect failed') ||
-        s.startsWith('Input stream closed') ||
-        s.startsWith('Classic Bluetooth is only supported')) {
-      const msg = 'Unable to communicate with W1';
+    if (s == 'W1 not paired') {
+      const msg = 'W1 not paired with phone';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+      return;
+    }
+    if (s.startsWith('Connect failed') || s.startsWith('Input stream closed')) {
+      const msg = 'W1 Bluetooth connection failed';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+      return;
+    }
+    if (s.contains('file server info not received')) {
+      const msg = 'W1 file server unavailable';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+      return;
+    }
+    if (s.startsWith('Classic Bluetooth is only supported')) {
+      const msg = 'Unable to connect to W1';
       w1StatusMessage.value = msg;
       _notifyW1Error(msg);
     }
@@ -245,18 +269,32 @@ class MapController extends GetxController {
   }
 
   Future<void> _ensureClassicStatusChannel() async {
+    debugPrint('[W1] ensureStatusChannel: start');
+    _w1ConnectAttemptStartedAt ??= DateTime.now();
+    _w1StatusResponseTimeout ??= Timer(const Duration(seconds: 8), () {
+      if (W1ClassicBluetooth.instance.latestStatus.value == null) {
+        const msg = 'Unable to connect to W1';
+        w1StatusMessage.value = msg;
+        _notifyW1Error(msg);
+      }
+      _w1StatusResponseTimeout?.cancel();
+      _w1StatusResponseTimeout = null;
+    });
     final hasPerm = await _ensureW1BluetoothPermissions();
     if (!hasPerm) {
-      const msg = 'Unable to communicate with W1';
+      const msg = 'Unable to connect to W1';
       w1StatusMessage.value = msg;
       _notifyW1Error(msg);
+      debugPrint('[W1] ensureStatusChannel: permissions denied');
       return;
     }
     try {
+      debugPrint('[W1] ensureStatusChannel: before connectBondedW1');
       await W1ClassicBluetooth.instance.ensureStatusChannel();
+      debugPrint('[W1] ensureStatusChannel: after connectBondedW1');
     } catch (e, st) {
       debugPrint('_ensureClassicStatusChannel: $e\n$st');
-      const msg = 'Unable to communicate with W1';
+      const msg = 'Unable to connect to W1';
       w1StatusMessage.value = msg;
       _notifyW1Error(msg);
       return;
@@ -267,7 +305,7 @@ class MapController extends GetxController {
       _w1StatusWaitTicks += 1;
       if (_w1StatusWaitTicks >= 2 && !_w1StatusTimeoutNotified) {
         _w1StatusTimeoutNotified = true;
-        const msg = 'W1 connected but device did not return file server info';
+        const msg = 'W1 file server unavailable';
         w1StatusMessage.value = msg;
         _notifyW1Error(msg);
       }
@@ -289,6 +327,11 @@ class MapController extends GetxController {
     if (isW1Recording.value) return;
     w1ImportError.value = '';
     w1ActiveRecording.value = null;
+    w1StatusMessage.value = 'Connecting to W1...';
+    _w1StatusResponseTimeout?.cancel();
+    _w1StatusResponseTimeout = null;
+    _w1ConnectAttemptStartedAt = null;
+    unawaited(_ensureClassicStatusChannel());
     Get.bottomSheet<void>(
       const W1RecordingImportSheet(),
       isScrollControlled: true,
@@ -302,7 +345,7 @@ class MapController extends GetxController {
   Future<void> fetchRecordings() async {
     w1ImportError.value = '';
     if (w1BaseUrl == null || w1BaseUrl!.isEmpty) {
-      w1ImportError.value = 'Connecting to W1...';
+      w1ImportError.value = 'Unable to connect to W1';
       return;
     }
     isFetchingRecordings.value = true;
@@ -322,8 +365,9 @@ class MapController extends GetxController {
     videoSelectedAt.value = null;
 
     if (w1BaseUrl == null || w1BaseUrl!.isEmpty) {
-      const msg = 'Connecting to W1...';
+      const msg = 'Unable to connect to W1';
       w1ImportError.value = msg;
+      _notifyW1Error(msg);
       return;
     }
 
@@ -714,6 +758,8 @@ class MapController extends GetxController {
   void onClose() {
     _w1StatusPollTimer?.cancel();
     _w1StatusPollTimer = null;
+    _w1StatusResponseTimeout?.cancel();
+    _w1StatusResponseTimeout = null;
     if (_w1ClassicStatusListener != null) {
       W1ClassicBluetooth.instance.latestStatus.removeListener(_w1ClassicStatusListener!);
       _w1ClassicStatusListener = null;

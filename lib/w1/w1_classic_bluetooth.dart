@@ -69,6 +69,9 @@ class W1ClassicBluetooth {
       }
     }
     isW1Bonded.value = device != null;
+    if (device != null) {
+      _log('bonded_device_found', {'name': device.name ?? '', 'address': device.address});
+    }
     _log('paired_device_lookup', {
       'found': isW1Bonded.value,
       'name': device?.name ?? '',
@@ -90,6 +93,7 @@ class W1ClassicBluetooth {
 
   /// Opens RFCOMM and requests STATUS using already paired device (no app pairing UX).
   Future<void> ensureStatusChannel() async {
+    _log('ensureStatusChannel_called');
     if (!Platform.isAndroid) return;
     final existing = _connection;
     if (existing != null && existing.isConnected) {
@@ -100,10 +104,13 @@ class W1ClassicBluetooth {
     }
     final device = await getBondedW1();
     if (device == null) {
+      _log('bonded_device_not_found', {'wantedName': w1DeviceName});
       status.value = 'W1 not paired';
       return;
     }
+    _log('before_connectBondedW1');
     await connectBondedW1();
+    _log('after_connectBondedW1');
   }
 
   /// Request Bluetooth on, list bonded devices, find [w1DeviceName], [BluetoothConnection.toAddress].
@@ -136,8 +143,10 @@ class W1ClassicBluetooth {
     });
 
     try {
+      _log('socket_connect_attempt', {'address': device.address});
       _connection = await BluetoothConnection.toAddress(device.address);
       isConnectionOpen.value = true;
+      _log('socket_connect_success', {'address': device.address});
       _log('Bluetooth connected', {'address': device.address});
       status.value = 'W1 paired';
 
@@ -147,10 +156,10 @@ class W1ClassicBluetooth {
           _appendAndParseStatus(data);
         },
         onError: (Object e, StackTrace st) {
-          _log('classic_receive_error', {'error': e.toString()});
+          _log('response_listener_error', {'error': e.toString()});
         },
         onDone: () {
-          _log('classic_input_done', {});
+          _log('response_listener_done', {});
           isConnectionOpen.value = false;
           status.value = 'Input stream closed';
         },
@@ -158,6 +167,7 @@ class W1ClassicBluetooth {
       );
       _requestStatus();
     } catch (e, st) {
+      _log('socket_connect_failure', {'error': e.toString()});
       _log('connect_failure', {'error': e.toString()});
       status.value = 'Connect failed: $e';
       debugPrintStack(stackTrace: st);
