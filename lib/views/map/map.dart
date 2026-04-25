@@ -1,9 +1,6 @@
 import 'package:falcon_one_demo/components/panel_button.dart';
-import 'package:falcon_one_demo/controllers/glasses_controller.dart';
 import 'package:falcon_one_demo/controllers/map_controller.dart';
-import 'package:falcon_one_demo/platform/bleequp_bridge.dart';
 import 'package:falcon_one_demo/mapbox_config.dart';
-import 'package:falcon_one_demo/widgets/glasses_status_banner.dart';
 import 'package:falcon_one_demo/widgets/incident_upload_status_panel.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_liquid_glass/liquid_glass.dart';
@@ -134,41 +131,6 @@ class MapView extends GetView<MapController> {
                       );
                     }),
                     Obx(() {
-                      final g = Get.find<GlassesController>();
-                      if (!BleeqUpBridge.isSupported) {
-                        return const SizedBox.shrink();
-                      }
-                      final connected = g.isConnected.value;
-                      final gr = g.isRecording.value;
-                      final scanning = g.isScanning.value;
-                      if (!connected) {
-                        return IconButton(
-                          tooltip: scanning ? 'Scanning…' : 'Connect glasses',
-                          onPressed: scanning ? null : () => g.beginConnectFlow(),
-                          icon: Icon(
-                            Icons.link,
-                            size: 22,
-                            color: scanning ? Colors.white38 : Colors.white70,
-                          ),
-                        );
-                      }
-                      return IconButton(
-                        tooltip: gr ? 'Glasses: stop recording' : 'Glasses: start recording',
-                        onPressed: () {
-                          if (gr) {
-                            g.stopRecording();
-                          } else {
-                            g.startRecording();
-                          }
-                        },
-                        icon: Icon(
-                          gr ? Icons.stop_circle_outlined : Icons.smart_display_outlined,
-                          size: 22,
-                          color: gr ? Colors.redAccent : Colors.white70,
-                        ),
-                      );
-                    }),
-                    Obx(() {
                       final hasVideo = controller.selectedVideo.value != null;
                       final busy = controller.isUploading.value;
                       final done =
@@ -263,7 +225,6 @@ class MapView extends GetView<MapController> {
               ),
             );
           }),
-          const GlassesStatusBanner(),
         ],
       ),
     );

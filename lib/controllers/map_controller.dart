@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart' as geo;
 import 'package:get/get.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 /// Inline upload card state (no duplicate snackbars for upload result).
 enum IncidentUploadUiPhase {
@@ -244,6 +245,13 @@ class MapController extends GetxController {
   }
 
   Future<void> _ensureClassicStatusChannel() async {
+    final hasPerm = await _ensureW1BluetoothPermissions();
+    if (!hasPerm) {
+      const msg = 'Unable to communicate with W1';
+      w1StatusMessage.value = msg;
+      _notifyW1Error(msg);
+      return;
+    }
     try {
       await W1ClassicBluetooth.instance.ensureStatusChannel();
     } catch (e, st) {
@@ -267,6 +275,13 @@ class MapController extends GetxController {
       _w1StatusWaitTicks = 0;
       _w1StatusTimeoutNotified = false;
     }
+  }
+
+  Future<bool> _ensureW1BluetoothPermissions() async {
+    if (!Platform.isAndroid) return false;
+    final scan = await Permission.bluetoothScan.request();
+    final connect = await Permission.bluetoothConnect.request();
+    return scan.isGranted && connect.isGranted;
   }
 
   /// W1: clock opens sheet, then [fetchLatestRecording] runs `GET /recordings/latest` → download → [selectedVideo].
