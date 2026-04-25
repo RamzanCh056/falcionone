@@ -56,6 +56,14 @@ class W1ClassicBluetooth {
     }
   }
 
+  String _rawUtf8(Uint8List data) {
+    try {
+      return utf8.decode(data, allowMalformed: true);
+    } catch (e) {
+      return '(decode: $e)';
+    }
+  }
+
   /// Finds bonded W1 (paired in OS settings).
   Future<BluetoothDevice?> getBondedW1() async {
     final bonded = await FlutterBluetoothSerial.instance.getBondedDevices();
@@ -152,6 +160,7 @@ class W1ClassicBluetooth {
 
       _inputSub = _connection!.input!.listen(
         (Uint8List data) {
+          _log('Raw response full', {'payload': _rawUtf8(data)});
           _log('Raw response', {'utf8': _utf8Preview(data), 'hex': _hexPreview(data)});
           _appendAndParseStatus(data);
         },
@@ -210,7 +219,7 @@ class W1ClassicBluetooth {
     final incoming = utf8.decode(data, allowMalformed: true);
     _rxBuffer.write(incoming);
     final text = _rxBuffer.toString();
-    final extracted = _extractStatusJson(text);
+    final extracted = _extractStatusJson(text) ?? _extractAnyJson(text);
     if (extracted == null) {
       if (text.length > 8192) {
         _rxBuffer
@@ -224,12 +233,14 @@ class W1ClassicBluetooth {
     try {
       final decoded = jsonDecode(jsonPayload);
       if (decoded is Map) {
-        final map = Map<String, dynamic>.from(decoded);
+        final map = _normalizeStatusMap(Map<String, dynamic>.from(decoded));
         latestStatus.value = map;
         status.value = 'W1 connected';
         final ip = map['file_server_ip']?.toString().trim() ?? '';
         final port = map['file_server_port']?.toString().trim() ?? '';
         _log('Parsed payload', {'payload': jsonPayload});
+        _log('file_server_ip exists', {'exists': ip.isNotEmpty});
+        _log('file_server_port exists', {'exists': port.isNotEmpty});
         _log('Extracted IP', {'value': ip});
         _log('Extracted Port', {'value': port});
       }
@@ -262,6 +273,38 @@ class W1ClassicBluetooth {
       }
     }
     return null;
+  }
+
+  (String, int)? _extractAnyJson(String text) {
+    final open = text.indexOf('{');
+    if (open < 0) return null;
+    var depth = 0;
+    for (var i = open; i < text.length; i++) {
+      final ch = text.codeUnitAt(i);
+      if (ch == 123) depth++;
+      if (ch == 125) depth--;
+      if (depth == 0) {
+        return (text.substring(open, i + 1), i + 1);
+      }
+    }
+    return null;
+  }
+
+  Map<String, dynamic> _normalizeStatusMap(Map<String, dynamic> map) {
+    Map<String, dynamic> source = map;
+    for (final k in const ['status', 'STATUS', 'payload', 'data', 'result']) {
+      final nested = source[k];
+      if (nested is Map) {
+        source = Map<String, dynamic>.from(nested);
+        break;
+      }
+    }
+
+    final ip = source['file_server_ip'] ?? source['fileServerIp'] ?? source['ip'] ?? source['host'];
+    final port = source['file_server_port'] ?? source['fileServerPort'] ?? source['port'];
+    if (ip != null) source['file_server_ip'] = ip;
+    if (port != null) source['file_server_port'] = port;
+    return source;
   }
 
   Future<void> disconnect() async {

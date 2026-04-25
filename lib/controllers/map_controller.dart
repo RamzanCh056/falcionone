@@ -92,9 +92,6 @@ class MapController extends GetxController {
   Timer? _w1StatusResponseTimeout;
   DateTime? _w1ConnectAttemptStartedAt;
 
-  /// Compatibility entrypoint; production path auto-discovers URL from Bluetooth STATUS.
-  void setW1BaseUrl(String ip, int port) => w1Service.setBaseUrl(ip, port);
-
   /// Nullable GPS for API / UI (null until fix acquired).
   double? get lat => incidentGpsReady.value ? incidentLatitude.value : null;
 
@@ -273,7 +270,7 @@ class MapController extends GetxController {
     _w1ConnectAttemptStartedAt ??= DateTime.now();
     _w1StatusResponseTimeout ??= Timer(const Duration(seconds: 8), () {
       if (W1ClassicBluetooth.instance.latestStatus.value == null) {
-        const msg = 'Unable to connect to W1';
+        const msg = 'W1 did not return file server info';
         w1StatusMessage.value = msg;
         _notifyW1Error(msg);
       }
